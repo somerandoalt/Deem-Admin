@@ -5,10 +5,11 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/neatdevs/Deem-Admin/r
 ```
 ---
 ## Update change-log
----
-  Added nicknames for the default commands and added the command Alias to give a nickname to a command (doesn't save across rejoins) and the command Aliases to check nicknames
-  Improved custom command loading so you don't need to rejoin in order to get the them just use the "reload" command.
-  Improved script loading.
+
+- Added nicknames for the default commands, plus the `alias` command to give a command a nickname (doesn't save across rejoins) and `aliases` to list nicknames. (works for custom as well)
+- Improved custom command loading: you no longer need to rejoin to pick up new commands, just use the `reload` command.
+- Improved script loading.
+
 ---
 
 Deem Admin is a modular admin system compatible with the legacy chat system or UI. It includes only essential universal commands by default.
@@ -24,24 +25,25 @@ Upon execution, a folder named `Deem_commands` will be created. To add a custom 
 
 2. **Define Command Logic**: Write the desired functionality inside the file.
 
-4. **Name the File**: The file's name becomes the command's name.  
+3. **Name the File**: The file's name becomes the command's name.  
    - Example: A file named `HelloWorld.lua` creates a `HelloWorld` command.
 
-5. **Run the Command**:  
+4. **Run the Command**:  
    - Type the file name (e.g., `HelloWorld`) in the input to execute it.  
    - Commands are **not case-sensitive** (e.g., `HeLLoWoRLd` will also work).
 
-6. **Always in include the return**
-   - If you do not include the return as the code part of the codde it won't execute and outputs an error.
+5. **Always include the return**
+   - If you do not include the return as the code part of the code it won't execute and outputs an error.
 
 PS: If you want to output any text to the console all you need to do is use: _G.CreateLabel.
 
 Example command/plugin for reference:
 
 ```lua
-return function(args)
-    print("TestCommand executed with args: " .. args)
-end
+  return function(...)
+      local args = {...}
+      print("TestCommand executed with args: " .. table.concat(args, " "))
+  end
 ```
 
 ---
