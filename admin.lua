@@ -675,6 +675,8 @@ local function split(str, sep)
 	return tokens
 end
 
+-- Loads custom commands from the Deem_commands folder.
+-- File name (without .lua/.txt) = command name. The file must return a function.
 local function loadCommands()
 	if not isfolder(CommandsDirectory) then
 		makefolder(CommandsDirectory)
@@ -686,7 +688,7 @@ local function loadCommands()
 		local fileName = filePath:match("[^\\^/]+%.lua$") or filePath:match("[^\\^/]+%.txt$")
 
 		if fileName then
-			local commandName = fileName:sub(1, #fileName - 4)
+			local commandName = fileName:sub(1, #fileName - 4):lower()
 			local fileContent = readfile(filePath)
 
 			local call, err = loadstring(fileContent)
@@ -704,6 +706,44 @@ local function loadCommands()
 	end
 end
 
+-- Nicknames: nickname = real command name
+-- (nicknames can also point at custom commands from Deem_commands, e.g. hp = headpat)
+local Aliases = {
+	cmds = "help",
+	remotes = "getremotes",
+	events = "getremoteevents",
+	funcs = "getremotefunctions",
+	nc = "noclip",
+	c = "clip",
+	fcd = "fireclickdetectors",
+	discord = "supportserver",
+	npc = "noproximitycooldown",
+	spoof = "spoofmemory",
+	tp = "tpgui",
+	afk = "antiafk",
+	fb = "fullbright",
+	cls = "clear",
+	save = "saveoutput",
+	hop = "serverhop",
+	rj = "rejoin",
+	ws = "walkspeed",
+	speed = "walkspeed",
+	jp = "jumppower",
+	pos = "getpos",
+	rl = "reload",
+	hp = "headpat",
+}
+
+local function resolveCommand(name)
+	name = string.lower(name)
+	if Commands[name] then
+		return name
+	end
+	if Aliases[name] then
+		return Aliases[name]
+	end
+	return name
+end
 
 Commands = {
 	help = function()
@@ -718,6 +758,33 @@ Commands = {
 		end
 
 		sendOutputFeedback(helpMessage)
+	end,
+
+	-- Reload custom commands from the Deem_commands folder without rejoining
+	reload = function(...)
+		loadCommands()
+		sendOutputFeedback("Commands reloaded!")
+	end,
+
+	-- alias <nickname> <command>  : adds a nickname until you rejoin
+	alias = function(nickname, target)
+		if not nickname or not target then
+			return sendOutputFeedback("Usage: alias <nickname> <command>")
+		end
+		nickname, target = nickname:lower(), target:lower()
+		if Commands[nickname] then
+			return sendOutputFeedback("'" .. nickname .. "' is already a command name.")
+		end
+		Aliases[nickname] = target
+		sendOutputFeedback("Nickname '" .. nickname .. "' now runs '" .. target .. "'")
+	end,
+
+	-- aliases : lists every nickname
+	aliases = function(...)
+		_G.CreateLabel("Nicknames:")
+		for nickname, target in pairs(Aliases) do
+			_G.CreateLabel(nickname .. " -> " .. target)
+		end
 	end,
 
 	getremotes = function(...)
@@ -966,11 +1033,19 @@ Commands = {
 	end, 
 }
 
+-- Load custom commands once, AFTER the Commands table exists so they aren't overwritten.
+-- (Use the "reload" command / its nickname "rl" to pick up new files later.)
+local loadOk, loadErr = pcall(loadCommands)
+if not loadOk then
+	warn("Deem Admin: could not load custom commands:", loadErr)
+end
+
 -- Chat Command Runner
 local function processChatMessage(message)
 	if message:sub(1, #ChatPrefix) == ChatPrefix then
 		local args = split(message:sub(#ChatPrefix + 1), " ")
-		local commandName = table.remove(args, 1):lower()
+		if #args == 0 then return end
+		local commandName = resolveCommand(table.remove(args, 1))
 
 		if Commands[commandName] then
 			local success, err = pcall(function()
@@ -991,7 +1066,8 @@ end
 -- Input Command Runner
 local function processInputCommand(cmd)
 	local args = split(cmd, " ")
-	local commandName = string.lower(args[1])
+	if #args == 0 then return end
+	local commandName = resolveCommand(args[1])
 	table.remove(args, 1)
 
 	if Commands[commandName] then
@@ -1027,4 +1103,3 @@ Input.FocusLost:Connect(function(enterPressed)
 end)
 
 plr.Chatted:Connect(processChatMessage)
-RunService.Heartbeat:Connect(loadCommands)
