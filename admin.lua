@@ -508,7 +508,7 @@ game.Players.PlayerRemoving:Connect(function(plr) -- Player leaves
 end)
 
 plr.OnTeleport:Connect(function()
-    queueteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/neatdevs/Deem-Admin/refs/heads/main/admin.lua'))()")
+    queueteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/somerandoalt/Deem-Admin/refs/heads/main/admin.lua'))()")
 end)
 
 --// Drag Function \\--
