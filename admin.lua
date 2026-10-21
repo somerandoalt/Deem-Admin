@@ -734,6 +734,9 @@ local Aliases = {
 	hp = "headpat",
 }
 
+-- Lets custom commands (like stand) see your nicknames, including ones added later with "alias"
+_G.DeemAliases = Aliases
+
 local function resolveCommand(name)
 	name = string.lower(name)
 	if Commands[name] then
