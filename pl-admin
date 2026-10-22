@@ -1,0 +1,4473 @@
+--[[
+	Deem Admin (merged)
+	Everything in one file: the admin GUI / command bar, the core commands and every custom command that used to
+	live in Deem_commands (antiarrest, antisit, arrestall, autoc4, autotpbomb, carbring, closehug, forcecrim, headpat,
+	hug, kiss, returnbydeath, silentgun, spamcars, stand, tpbomb, ufo).
+
+	Run it with:  loadstring(game:HttpGet('https://raw.githubusercontent.com/somerandoalt/Deem-Admin/refs/heads/main/admin.lua'))()
+	Command bar: press ;   Chat: ;command args
+	Files in Deem_commands are still loaded, but a built-in command always wins over a file with the same name.
+]]
+
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+-- Running the script again replaces the old copy instead of stacking a second GUI
+if _G.DeemAdminGui then
+	pcall(function() _G.DeemAdminGui:Destroy() end)
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local StarterGui = game:GetService("StarterGui")
+local MarketplaceService = game:GetService("MarketplaceService")
+local VirtualUser = game:GetService("VirtualUser")
+local CoreGui = game:GetService("CoreGui")
+
+local lplr = Players.LocalPlayer
+local plr = lplr
+local PlaceId = game.PlaceId
+local IsOnMobile = table.find({ Enum.Platform.IOS, Enum.Platform.Android }, UserInputService:GetPlatform())
+local queueteleport = queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
+
+local CommandsDirectory = "Deem_commands"
+local ChatPrefix = ";"
+local Commands = {}
+local Aliases = {}
+
+-- Nicknames: nickname = real command name (add more at runtime with "alias <nickname> <command>")
+for nick, target in pairs({
+	cmds = "help", remotes = "getremotes", events = "getremoteevents", funcs = "getremotefunctions",
+	nc = "noclip", c = "clip", fcd = "fireclickdetectors", discord = "supportserver",
+	npc = "noproximitycooldown", spoof = "spoofmemory", tp = "tpgui", afk = "antiafk",
+	fb = "fullbright", cls = "clear", save = "saveoutput", hop = "serverhop", rj = "rejoin",
+	ws = "walkspeed", speed = "walkspeed", jp = "jumppower", pos = "getpos", rl = "reload",
+	hp = "headpat", ch = "closehug", atb = "autotpbomb",
+}) do
+	Aliases[nick] = target
+end
+-- Lets the stand command see your nicknames, including ones added later with "alias"
+_G.DeemAliases = Aliases
+
+--// Shared library \\--------------------------------------------------------------
+-- Everything the commands used to copy into every file lives here once.
+
+local D = { builtin = {} }
+
+function D.logger(tag)
+	return function(msg)
+		if _G.CreateLabel then
+			_G.CreateLabel("[" .. tag .. "]: " .. msg)
+		else
+			print("[" .. tag .. "]: " .. msg)
+		end
+	end
+end
+
+function D.getMe()
+	local char = lplr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return char, hum, root
+	end
+end
+
+function D.getParts(p)
+	local char = p.Character
+	return char, char and char:FindFirstChildOfClass("Humanoid"), char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- Exact name / display name first (so "00" picks the player called 00), then a prefix match. "@name" = username only.
+function D.findPlayer(name, includeSelf)
+	name = tostring(name):lower()
+	local usernameOnly = false
+	if name:sub(1, 1) == "@" then
+		name, usernameOnly = name:sub(2), true
+	end
+	local function matches(p, exact)
+		if p == lplr and not includeSelf then return false end
+		local n, d = p.Name:lower(), p.DisplayName:lower()
+		if exact then
+			return n == name or (not usernameOnly and d == name)
+		end
+		return n:sub(1, #name) == name or (not usernameOnly and d:sub(1, #name) == name)
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if matches(p, true) then return p end
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if matches(p, false) then return p end
+	end
+end
+
+-- Every prefix match (for commands that take a whole group)
+function D.findPlayers(name)
+	name = tostring(name):lower()
+	local found = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= lplr and (p.Name:lower():sub(1, #name) == name or p.DisplayName:lower():sub(1, #name) == name) then
+			table.insert(found, p)
+		end
+	end
+	return found
+end
+
+function D.findTeam(name)
+	name = name:lower()
+	for _, team in ipairs(game:GetService("Teams"):GetTeams()) do
+		if team.Name:lower():sub(1, #name) == name then
+			return team
+		end
+	end
+end
+
+function D.isNeutral(p)
+	return p.Neutral or p.Team == nil or p.Team.Name == "Neutral"
+end
+
+function D.teamName(p)
+	return p.Team and p.Team.Name or "Neutral"
+end
+
+local friendCache = {}
+function D.isFriend(p)
+	if friendCache[p.UserId] == nil then
+		local ok, res = pcall(function() return lplr:IsFriendsWith(p.UserId) end)
+		friendCache[p.UserId] = ok and res or false
+	end
+	return friendCache[p.UserId]
+end
+
+function D.remote(name)
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	return remotes and remotes:FindFirstChild(name)
+end
+
+-- Criminal + forcefield: when you respawn as a Criminal you get a forcefield, and teleporting into the prison
+-- while it's on is a problem, so commands wait until it's gone before carrying on.
+local PRISON_CENTER = Vector3.new(775.5, 122.74, 2328)
+local PRISON_SIZE = Vector3.new(574, 300, 548)
+
+function D.inPrison(pos)
+	local rel = pos - PRISON_CENTER
+	local half = PRISON_SIZE / 2
+	return math.abs(rel.X) <= half.X and math.abs(rel.Y) <= half.Y and math.abs(rel.Z) <= half.Z
+end
+
+-- true while you're a Criminal with a forcefield and `pos` is inside the prison
+function D.ffBlocks(pos)
+	local char = lplr.Character
+	return pos ~= nil and lplr.Team ~= nil and lplr.Team.Name == "Criminals"
+		and char ~= nil and char:FindFirstChildOfClass("ForceField") ~= nil
+		and D.inPrison(pos)
+end
+
+-- For loops that run every frame: true while we should hold still (says so once when it starts and when it ends)
+local ffTold = false
+function D.ffGate(pos, say)
+	say = say or print
+	if D.ffBlocks(pos) then
+		if not ffTold then
+			ffTold = true
+			say("Waiting - you're a Criminal with a forcefield and the destination is in the prison")
+		end
+		return true
+	end
+	if ffTold then
+		ffTold = false
+		say("Forcefield gone - continuing")
+	end
+	return false
+end
+
+-- For one-off steps: yields until it's safe to teleport to getPos() (a function returning a Vector3, or nil)
+function D.waitForForcefield(getPos, cancelled, say)
+	while D.ffGate(getPos(), say) do
+		if cancelled and cancelled() then
+			ffTold = false
+			break
+		end
+		task.wait(0.1)
+	end
+end
+
+-- Anti-sit (antisit) would stop us sitting in cars, so commands that need seats pause it while they run
+function D.pauseAntiSit()
+	local s = _G.DeemAntiSit
+	if type(s) == "table" and type(s.pause) == "function" then
+		pcall(s.pause)
+		return true
+	end
+	return false
+end
+
+function D.resumeAntiSit(paused)
+	local s = _G.DeemAntiSit
+	if paused and type(s) == "table" and type(s.resume) == "function" then
+		pcall(s.resume)
+	end
+end
+
+-- Flag other commands can read ("is tpbomb / carbring / forcecrim / autoc4 running?")
+function D.setBusy(name, value)
+	_G.DeemBusy = _G.DeemBusy or {}
+	_G.DeemBusy[name] = value
+end
+
+function D.standUp()
+	local _, hum = D.getMe()
+	if hum then
+		hum.Sit = false
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+		local t = os.clock()
+		while hum.SeatPart and os.clock() - t < 1 do
+			task.wait()
+		end
+	end
+end
+
+function D.sitIn(seat, timeout)
+	local char = lplr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false end
+	local t = os.clock()
+	repeat
+		task.wait()
+		if not seat.Parent then return false end
+		char:PivotTo(seat.CFrame)
+		seat:Sit(hum)
+	until hum.SeatPart == seat or os.clock() - t > (timeout or 2)
+	return hum.SeatPart == seat
+end
+
+-- Catalog animations are packages and the real animation id is inside them (same as Infinite Yield's anim2track).
+-- Cached, because game:GetObjects is slow.
+local animCache = {}
+function D.anim2track(asset_id)
+	if animCache[asset_id] then return animCache[asset_id] end
+	local result = asset_id
+	local ok, objs = pcall(function() return game:GetObjects(asset_id) end)
+	if ok and objs then
+		for i = 1, #objs do
+			if objs[i]:IsA("Animation") then
+				result = objs[i].AnimationId
+				break
+			end
+		end
+	end
+	animCache[asset_id] = result
+	return result
+end
+
+function D.getAnimator(hum)
+	return hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+end
+
+-- Cars ---------------------------------------------------------------------------------
+local COOLDOWN_MSG = "Wait for the cooldown"
+local BUTTON_RANGE = 12
+local reportedAnswers = {}
+
+-- Every "Car Spawner" button on the map
+function D.getSpawners()
+	local list, seenPos = {}, {}
+	local function collect(root)
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name:lower() == "car spawner" then
+				local key = tostring(d.Position)
+				if not seenPos[key] then
+					seenPos[key] = true
+					table.insert(list, d)
+				end
+			end
+		end
+	end
+	local items = workspace:FindFirstChild("Prison_ITEMS")
+	if items then collect(items) end
+	if #list == 0 then collect(workspace) end -- not where we expected: search the whole map
+	return list
+end
+
+-- Goes to the spawner, presses it, and returns the new car (or nil + why)
+function D.spawnAt(spawner, remote, container)
+	local _, _, root = D.getMe()
+	if not root then
+		return nil, "your character isn't ready"
+	end
+	-- The server only lets us press a spawner from close by
+	if (root.Position - spawner.Position).Magnitude > BUTTON_RANGE then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.CFrame = CFrame.new(spawner.Position + Vector3.new(0, 3, 0))
+		task.wait(0.372) -- let the server see where we are
+	end
+
+	local Car
+	local conn = container.ChildAdded:Connect(function(child)
+		Car = Car or child
+	end)
+	local ok, result = pcall(function() return remote:InvokeServer(spawner) end)
+	if ok and result ~= COOLDOWN_MSG then
+		local t = os.clock()
+		while not Car and os.clock() - t < 1.5 do
+			task.wait()
+		end
+		if not Car and type(result) == "string" and not reportedAnswers[result] then
+			reportedAnswers[result] = true
+			D.logger("cars")("A spawner answered: \"" .. result .. "\" (no car appeared)")
+		end
+	end
+	conn:Disconnect()
+
+	if Car then return Car end
+	if ok and result == COOLDOWN_MSG then return nil, "cooldown" end
+	return nil, ok and "no car appeared" or "the press errored"
+end
+
+-- Tries every spawner until a car appears. Returns the car, or nil + why.
+function D.spawnCar(say, cancelled, timeout)
+	local remote = D.remote("InteractWithItem")
+	local container = workspace:FindFirstChild("CarContainer")
+	if not (remote and container) then return nil, "Couldn't find the car remote / CarContainer" end
+	local spawners = D.getSpawners()
+	if #spawners == 0 then return nil, "No 'Car Spawner' found" end
+	local deadline = os.clock() + (timeout or 20)
+	while os.clock() < deadline and not (cancelled and cancelled()) do
+		for _, spawner in ipairs(spawners) do
+			local car, why = D.spawnAt(spawner, remote, container)
+			if car then return car end
+			if why == "your character isn't ready" then return nil, why end
+		end
+		task.wait(0.1)
+	end
+	return nil, "Couldn't get a car"
+end
+
+-- C4 -----------------------------------------------------------------------------------
+local GIVER_POS = Vector3.new(-901, 95, 2042) -- where you stand to use the C4 giver
+
+-- Any tool with "C4" in its name counts (the item may be called "C4" or "C4 Explosive")
+function D.getC4()
+	local function look(container)
+		if not container then return nil end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and t.Name:upper():find("C4", 1, true) then
+				return t
+			end
+		end
+	end
+	return look(lplr.Character) or look(lplr:FindFirstChildWhichIsA("Backpack"))
+end
+
+function D.equipC4()
+	local _, hum = D.getMe()
+	local tool = D.getC4()
+	if not (hum and tool) then return false end
+	if tool.Parent ~= lplr.Character then
+		hum:EquipTool(tool)
+		local t = os.clock()
+		while tool.Parent ~= lplr.Character and os.clock() - t < 1.5 do
+			task.wait()
+		end
+	end
+	return tool.Parent == lplr.Character
+end
+
+function D.unequip()
+	local _, hum = D.getMe()
+	if hum then hum:UnequipTools() end
+	task.wait(0.05)
+end
+
+-- Teleports to the C4 giver and picks one up (does NOT go back). Returns true if we have a C4.
+function D.grabC4(say)
+	local interact = D.remote("InteractWithItem")
+	local items = workspace:FindFirstChild("Prison_ITEMS")
+	local giver = items and items:FindFirstChild("giver")
+	local c4 = giver and giver:FindFirstChild("C4 Explosive")
+	local explosive = c4 and c4:FindFirstChild("Explosive")
+	if not (interact and explosive) then
+		say("Couldn't find the C4 remote / giver")
+		return false
+	end
+	for _ = 1, 8 do
+		if D.getC4() then return true end
+		local c, _, r = D.getMe()
+		if not r then return false end -- we died
+		r.AssemblyLinearVelocity = Vector3.zero
+		c:PivotTo(CFrame.new(GIVER_POS))
+		task.wait(0.3) -- make sure we're at the giver before pressing
+		local ok, res = pcall(function() return interact:InvokeServer(explosive) end)
+		local t = os.clock()
+		while not D.getC4() and os.clock() - t < 1 do
+			task.wait()
+		end
+		if D.getC4() then return true end
+		if ok and type(res) == "string" then
+			say("Giver answered: " .. res)
+		end
+	end
+	return false
+end
+D.GIVER_POS = GIVER_POS
+
+-- Runs a command by name or nickname (used by the stand and by the runners below)
+local function resolveCommand(name)
+	name = string.lower(name)
+	if Commands[name] then return name end
+	return Aliases[name] or name
+end
+
+function D.runCommand(name, ...)
+	local cmd = resolveCommand(name)
+	local fn = Commands[cmd]
+	if not fn then
+		error("unknown command: " .. cmd)
+	end
+	return fn(...)
+end
+_G.DeemRunCommand = D.runCommand
+
+--// GUI \\--------------------------------------------------------------------------
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local DARK, MID = Color3.fromRGB(35, 35, 36), Color3.fromRGB(45, 45, 47)
+local WHITE = Color3.new(1, 1, 1)
+
+local ScreenGui = mk("ScreenGui", { Name = "DeemAdmin", ResetOnSpawn = false }, (gethui and gethui()) or CoreGui)
+_G.DeemAdminGui = ScreenGui
+
+local Output = mk("Frame", {
+	Name = "Output", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = DARK, BorderSizePixel = 0,
+	Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(338, 20), ZIndex = 10, Active = true,
+}, ScreenGui)
+
+local Background = mk("Frame", {
+	Name = "Background", BackgroundColor3 = DARK, BorderSizePixel = 0, ClipsDescendants = true,
+	Position = UDim2.new(0, 0, 1, 0), Size = UDim2.fromOffset(338, 245),
+}, Output)
+
+local Chat = mk("Frame", {
+	Name = "Chat", BackgroundColor3 = DARK, ClipsDescendants = true, Size = UDim2.fromOffset(338, 245), ZIndex = 10,
+}, Background)
+
+local Scroll = mk("ScrollingFrame", {
+	Name = "Scroll", Active = true, BackgroundColor3 = MID, BorderSizePixel = 0,
+	Position = UDim2.fromOffset(5, 5), Size = UDim2.fromOffset(328, 210), ZIndex = 10,
+	BottomImage = "rbxasset://textures/ui/Scroll/scroll-middle.png", TopImage = "rbxasset://textures/ui/Scroll/scroll-middle.png",
+	CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 8,
+}, Chat)
+mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, Scroll)
+
+local Input = mk("TextBox", {
+	Name = "Input", AnchorPoint = Vector2.new(0.5, 0), BackgroundColor3 = MID, BorderSizePixel = 0,
+	Position = UDim2.new(0.5, 0, 0, 220), Size = UDim2.fromOffset(328, 20), ZIndex = 10, Font = Enum.Font.SourceSans,
+	PlaceholderText = "Command Bar (;)", Text = "", TextColor3 = WHITE, TextSize = 14, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+}, Chat)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 1) }, Input)
+
+local function headerButton(parent, xOffset, image, iconSize)
+	local b = mk("TextButton", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(1, xOffset, 0, 0),
+		Size = UDim2.fromOffset(20, 20), ZIndex = 10, Text = "",
+	}, parent)
+	mk("ImageLabel", {
+		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(iconSize, iconSize), ZIndex = 10, Image = image,
+	}, b)
+	return b
+end
+
+local Shadow = mk("Frame", {
+	Name = "Shadow", BackgroundColor3 = MID, Position = UDim2.new(0, 0, 0.01, 0), Size = UDim2.fromOffset(338, 20), ZIndex = 10,
+}, Output)
+local Title = mk("TextLabel", {
+	Name = "PopupText", BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0.95, 0), ZIndex = 11,
+	Font = Enum.Font.SourceSansBold, Text = "Deem Admin", TextColor3 = WHITE, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+}, Shadow)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 5) }, Title)
+
+headerButton(Shadow, -20, "rbxassetid://5054663650", 10).MouseButton1Click:Connect(function()
+	ScreenGui:Destroy()
+end)
+local mainOpen = true
+headerButton(Shadow, -40, "rbxassetid://2406617031", 14).MouseButton1Click:Connect(function()
+	mainOpen = not mainOpen
+	if mainOpen then
+		Background:TweenSize(UDim2.fromOffset(338, 245), "Out", "Quart", 0.3, true)
+	else
+		Background:TweenSize(UDim2.new(1, 0, 0, 0), "In", "Quart", 0.3, true)
+	end
+end)
+
+-- Teleport GUI (the "tpgui" command)
+local Goto = mk("Frame", {
+	Name = "Goto", AnchorPoint = Vector2.new(1, 0), BackgroundColor3 = MID, Position = UDim2.new(1, -1, 0, 0),
+	Size = UDim2.new(0, 169, 1, 0), Visible = false,
+}, Output)
+local GotoTitle = mk("TextLabel", {
+	Name = "PopupText", BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0.95, 0), ZIndex = 1,
+	Font = Enum.Font.SourceSansBold, Text = "Teleport Gui", TextColor3 = WHITE, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+}, Goto)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 2) }, GotoTitle)
+local Background_2 = mk("Frame", {
+	Name = "Background_2", BackgroundColor3 = DARK, Position = UDim2.new(0, 0, 1, 0), Size = UDim2.fromOffset(169, 245), ClipsDescendants = true,
+}, Goto)
+local Scroll_2 = mk("ScrollingFrame", {
+	Name = "Scroll_2", Active = true, AnchorPoint = Vector2.new(0.5, 0), BackgroundColor3 = MID, BorderSizePixel = 0,
+	Position = UDim2.new(0.5, 0, 0, 5), Size = UDim2.new(1, -10, 1, -40), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	BottomImage = "rbxasset://textures/ui/Scroll/scroll-middle.png", TopImage = "rbxasset://textures/ui/Scroll/scroll-middle.png", ScrollBarThickness = 4,
+}, Background_2)
+mk("UIListLayout", { HorizontalAlignment = Enum.HorizontalAlignment.Center, Padding = UDim.new(0, 5) }, Scroll_2)
+mk("UIPadding", { PaddingRight = UDim.new(0, 5), PaddingTop = UDim.new(0, 5) }, Scroll_2)
+local TP = mk("TextButton", {
+	Name = "TP", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = MID, BorderSizePixel = 0, Position = UDim2.new(0.5, 0, 0, 228),
+	Size = UDim2.new(1, -10, 0, 25), Font = Enum.Font.SourceSans, Text = "Teleport to selected player.", TextColor3 = WHITE, TextSize = 14,
+}, Background_2)
+
+headerButton(GotoTitle, -20, "rbxassetid://5054663650", 10).MouseButton1Click:Connect(function()
+	Goto:TweenPosition(UDim2.new(1, -1, 0, 0), "In", "Sine", 0.3, true)
+	task.wait(0.3)
+	Goto.Visible = false
+end)
+local gotoOpen = true
+headerButton(GotoTitle, -40, "rbxassetid://2406617031", 14).MouseButton1Click:Connect(function()
+	gotoOpen = not gotoOpen
+	if gotoOpen then
+		Background_2:TweenSize(UDim2.fromOffset(169, 245), "Out", "Sine", 0.3, true)
+	else
+		Background_2:TweenSize(UDim2.new(1, 0, 0, 0), "In", "Sine", 0.3, true)
+	end
+end)
+
+local selectedName, selectedButton = nil, nil
+local function selectPlayerButton(button)
+	if selectedButton then selectedButton.BackgroundColor3 = Color3.fromRGB(50, 50, 57) end
+	if selectedButton == button then
+		selectedName, selectedButton = nil, nil
+		return
+	end
+	selectedName, selectedButton = button.Name, button
+	button.BackgroundColor3 = Color3.fromRGB(87, 87, 99)
+end
+
+local function addPlayerButton(player)
+	if Scroll_2:FindFirstChild(player.Name) then return end
+	local b = mk("TextButton", {
+		Name = player.Name, BackgroundColor3 = Color3.fromRGB(50, 50, 57), Size = UDim2.new(1, -10, 0, 25), Font = Enum.Font.SourceSans,
+		Text = player.DisplayName, TextColor3 = WHITE, TextScaled = true,
+	}, Scroll_2)
+	b.MouseButton1Down:Connect(function() selectPlayerButton(b) end)
+end
+
+Players.PlayerAdded:Connect(addPlayerButton)
+Players.PlayerRemoving:Connect(function(p)
+	local b = Scroll_2:FindFirstChild(p.Name)
+	if b then
+		if b == selectedButton then selectedName, selectedButton = nil, nil end
+		b:Destroy()
+	end
+end)
+
+TP.MouseButton1Click:Connect(function()
+	local target = selectedName and Players:FindFirstChild(selectedName)
+	if not target then
+		return _G.CreateLabel("A player hasn't been selected yet!")
+	end
+	local _, hum, myRoot = D.getParts(lplr)
+	local _, _, tRoot = D.getParts(target)
+	if not (myRoot and tRoot) then return end
+	if hum and hum.SeatPart then
+		hum.Sit = false
+		task.wait(0.1)
+	end
+	myRoot.CFrame = tRoot.CFrame + Vector3.new(3, 1, 0)
+end)
+
+-- Dragging
+do
+	local dragging, dragInput, dragStart, startPos
+	Output.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, Output.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	Output.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - dragStart
+			TweenService:Create(Output, TweenInfo.new(0.2), {
+				Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y),
+			}):Play()
+		end
+	end)
+end
+
+--// Output log \\--
+
+local function Time()
+	local t = os.date("*t")
+	local h = t.hour % 12
+	if h == 0 then h = 12 end
+	return string.format("%02d:%02d:%02d %s", h, t.min, t.sec, t.hour >= 12 and "PM" or "AM")
+end
+
+local lastMessage, lastLabel, dupeCount, labelOrder = nil, nil, 1, 0
+local MAX_LABELS = 500
+
+_G.CreateLabel = function(text)
+	text = tostring(text)
+	if lastMessage == text and lastLabel and lastLabel.Parent then
+		dupeCount += 1
+		lastLabel.Text = Time() .. " - " .. text .. " (x" .. dupeCount .. ")"
+		return
+	end
+	dupeCount = 1
+	lastMessage = text
+	labelOrder += 1
+
+	local labels = {}
+	for _, c in ipairs(Scroll:GetChildren()) do
+		if c:IsA("TextLabel") then table.insert(labels, c) end
+	end
+	if #labels >= MAX_LABELS then
+		table.sort(labels, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+		for i = 1, #labels - MAX_LABELS + 1 do labels[i]:Destroy() end
+	end
+
+	local tl = mk("TextLabel", {
+		Name = "Line", LayoutOrder = labelOrder, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 10,
+		Text = Time() .. " - " .. text, Size = UDim2.new(1, -12, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		Font = Enum.Font.SourceSans, TextSize = 14, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, TextColor3 = WHITE, TextTransparency = 1,
+	}, Scroll)
+	lastLabel = tl
+	TweenService:Create(tl, TweenInfo.new(0.6, Enum.EasingStyle.Linear), { TextTransparency = 0 }):Play()
+	task.defer(function()
+		Scroll.CanvasPosition = Vector2.new(0, Scroll.AbsoluteCanvasSize.Y)
+	end)
+end
+
+local function sendChatFeedback(message)
+	pcall(function()
+		StarterGui:SetCore("ChatMakeSystemMessage", {
+			Text = "[Deem Admin]: " .. message, Color = WHITE, Font = Enum.Font.SourceSansBold, FontSize = Enum.FontSize.Size18,
+		})
+	end)
+end
+
+local function sendOutputFeedback(message)
+	_G.CreateLabel("[Deem Admin]: " .. message)
+end
+
+sendChatFeedback("Welcome to Deem Admin (Beta)!\nType ';help' in the chat for a list of commands")
+sendOutputFeedback("Welcome to Deem Admin (Beta)!\nType 'help' in the command bar for a list of commands")
+if IsOnMobile then
+	sendOutputFeedback("You are currently on mobile. If Deem Admin doesn't work for you please send your executor and platform to the discord.\nPlease join here to get help: discord.gg/su7ycRRJyz")
+end
+
+plr.OnTeleport:Connect(function()
+	if queueteleport then
+		queueteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/somerandoalt/Deem-Admin/refs/heads/main/admin.lua'))()")
+	end
+end)
+
+--// Core commands \\--------------------------------------------------------------------
+
+local function getHum()
+	local char = lplr.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function listRemotes(events, funcs)
+	for _, v in ipairs(game:GetDescendants()) do
+		if events and v:IsA("BaseRemoteEvent") then
+			sendOutputFeedback("\nRemoteEvent found!  \nLocation: " .. v:GetFullName() .. "  \nMethod  FireServer\n")
+		elseif funcs and v:IsA("RemoteFunction") then
+			sendOutputFeedback("\nRemoteFunction found! \nLocation: " .. v:GetFullName() .. "  \nMethod | InvokeServer\n")
+		end
+	end
+end
+
+local noclipConn
+local fullbrightSaved
+
+Commands.help = function()
+	sendOutputFeedback("Available Commands:")
+	local names = {}
+	for name in pairs(Commands) do table.insert(names, name) end
+	table.sort(names)
+	for i, name in ipairs(names) do
+		_G.CreateLabel(i .. ") " .. name)
+	end
+end
+
+-- Reload custom commands from the Deem_commands folder without rejoining
+Commands.reload = function()
+	D.loadExternal()
+	sendOutputFeedback("Commands reloaded!")
+end
+
+-- alias <nickname> <command>  : adds a nickname until you rejoin
+Commands.alias = function(nickname, target)
+	if not nickname or not target then
+		return sendOutputFeedback("Usage: alias <nickname> <command>")
+	end
+	nickname, target = nickname:lower(), target:lower()
+	if Commands[nickname] then
+		return sendOutputFeedback("'" .. nickname .. "' is already a command name.")
+	end
+	Aliases[nickname] = target
+	sendOutputFeedback("Nickname '" .. nickname .. "' now runs '" .. target .. "'")
+end
+
+Commands.aliases = function()
+	_G.CreateLabel("Nicknames:")
+	for nickname, target in pairs(Aliases) do
+		_G.CreateLabel(nickname .. " -> " .. target)
+	end
+end
+
+Commands.getremotes = function() listRemotes(true, true) end
+Commands.getremoteevents = function() listRemotes(true, false) end
+Commands.getremotefunctions = function() listRemotes(false, true) end
+
+-- noclip is a toggle now: the game resets CanCollide every frame, so a one-off set never lasted
+Commands.noclip = function(arg)
+	local want = (arg == nil) and (noclipConn == nil) or (tostring(arg):lower() == "on")
+	if noclipConn then
+		noclipConn:Disconnect()
+		noclipConn = nil
+	end
+	if want then
+		noclipConn = RunService.Stepped:Connect(function()
+			local char = lplr.Character
+			if not char then return end
+			for _, v in ipairs(char:GetDescendants()) do
+				if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+			end
+		end)
+	end
+	sendOutputFeedback("Noclip " .. (want and "ON" or "OFF"))
+end
+
+Commands.clip = function()
+	Commands.noclip("off")
+end
+
+Commands.fireclickdetectors = function()
+	for _, v in ipairs(workspace:GetDescendants()) do
+		if v:IsA("ClickDetector") then
+			fireclickdetector(v)
+		end
+	end
+end
+
+Commands.supportserver = function()
+	sendOutputFeedback("discord.gg/su7ycRRJyz\n Server link has been copied to your clipboard.\n")
+	if setclipboard then setclipboard("discord.gg/su7ycRRJyz") end
+end
+
+-- Connects once (the old version looped forever and connected a new handler every frame)
+local proxConn
+Commands.noproximitycooldown = function()
+	if proxConn then
+		proxConn:Disconnect()
+		proxConn = nil
+		return sendOutputFeedback("Proximity prompts back to normal")
+	end
+	proxConn = game:GetService("ProximityPromptService").PromptButtonHoldBegan:Connect(function(prompt)
+		pcall(fireproximityprompt, prompt)
+	end)
+	sendOutputFeedback("Proximity prompts fire instantly (run it again to turn off)")
+end
+
+Commands.spoofmemory = function()
+	hookfunction((gcinfo or collectgarbage), function()
+		return math.random(200, 350)
+	end)
+	local gamemt = getrawmetatable(game)
+	setreadonly(gamemt, false)
+	local nc = gamemt.__namecall
+	gamemt.__namecall = newcclosure(function(...)
+		if getnamecallmethod() == "GetTotalMemoryUsageMb" then
+			return math.random(395, 405)
+		end
+		return nc(...)
+	end)
+	hookfunction(game.Stats.GetTotalMemoryUsageMb, function()
+		return math.random(395, 405)
+	end)
+	sendOutputFeedback("Memory Spoofed!\n")
+end
+
+Commands.tpgui = function()
+	Goto.Visible = true
+	Goto:TweenPosition(UDim2.new(1, 179, 0, 0), Enum.EasingDirection.Out, Enum.EasingStyle.Sine, 0.3, true)
+	for _, p in ipairs(Players:GetPlayers()) do
+		addPlayerButton(p)
+	end
+end
+
+Commands.antiafk = function()
+	if getconnections then
+		for _, v in ipairs(getconnections(lplr.Idled)) do
+			pcall(function() v:Disable() end)
+		end
+	end
+	if not D.afkConn then
+		-- fallback that works without getconnections: answer the idle kick with a fake click
+		D.afkConn = lplr.Idled:Connect(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+	sendOutputFeedback("Anti-AFK on")
+end
+
+Commands.fullbright = function()
+	if fullbrightSaved then
+		for k, v in pairs(fullbrightSaved) do Lighting[k] = v end
+		fullbrightSaved = nil
+		return sendOutputFeedback("Fullbright OFF")
+	end
+	fullbrightSaved = {
+		Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, FogEnd = Lighting.FogEnd,
+		GlobalShadows = Lighting.GlobalShadows, OutdoorAmbient = Lighting.OutdoorAmbient,
+	}
+	Lighting.Brightness = 2
+	Lighting.ClockTime = 14
+	Lighting.FogEnd = 100000
+	Lighting.GlobalShadows = false
+	Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+	sendOutputFeedback("Fullbright ON (run it again to undo)")
+end
+
+Commands.clear = function()
+	for _, child in ipairs(Scroll:GetChildren()) do
+		if child:IsA("TextLabel") then child:Destroy() end
+	end
+	lastLabel, lastMessage = nil, nil
+end
+
+Commands.saveoutput = function()
+	if type(writefile) ~= "function" then
+		return _G.CreateLabel("Your exploit does not support write file. You cannot save chat logs.")
+	end
+	local lines = {}
+	for _, child in ipairs(Scroll:GetChildren()) do
+		if child:IsA("TextLabel") then table.insert(lines, child.Text) end
+	end
+	if #lines == 0 then return end
+	local okInfo, info = pcall(function() return MarketplaceService:GetProductInfo(PlaceId) end)
+	local placeName = tostring(okInfo and info.Name or PlaceId):gsub("[*\\?:<>|]+", ""):sub(1, 175)
+	local fileName, n = nil, 0
+	repeat
+		fileName = placeName .. " Output Logs (" .. n .. ").txt"
+		n += 1
+	until not (type(isfile) == "function" and isfile(fileName))
+	pcall(writefile, fileName, '-- Deem Admin Output logs for "' .. placeName .. '"\n\n' .. table.concat(lines, "\n"))
+	_G.CreateLabel("Saved output logs to " .. fileName .. " in your executor's workspace folder.")
+end
+
+Commands.serverhop = function()
+	local ok, body = pcall(function()
+		return game:HttpGetAsync("https://games.roblox.com/v1/games/" .. PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+	end)
+	if not ok then return sendOutputFeedback("Couldn't get the server list") end
+	local servers = {}
+	for _, v in ipairs(HttpService:JSONDecode(body).data) do
+		if type(v) == "table" and v.maxPlayers > v.playing and v.id ~= game.JobId then
+			servers[#servers + 1] = v.id
+		end
+	end
+	if #servers > 0 then
+		TeleportService:TeleportToPlaceInstance(PlaceId, servers[math.random(1, #servers)])
+	else
+		sendOutputFeedback("No other server with room found")
+	end
+end
+
+Commands.rejoin = function()
+	TeleportService:Teleport(PlaceId, lplr)
+end
+
+-- These read the live character, so they keep working after you respawn
+Commands.walkspeed = function(ws)
+	local hum = getHum()
+	if hum then hum.WalkSpeed = tonumber(ws) or 16 end
+end
+
+Commands.jumppower = function(jp)
+	local hum = getHum()
+	if hum then
+		hum.UseJumpPower = true
+		hum.JumpPower = tonumber(jp) or 50
+	end
+end
+
+Commands.getpos = function()
+	local _, _, root = D.getMe()
+	if root then
+		local p = root.Position
+		sendOutputFeedback(string.format("%.2f, %.2f, %.2f", p.X, p.Y, p.Z))
+	end
+end
+
+--// Custom commands \\------------------------------------------------------------------
+
+-- antisit ------------------------------------------------------------------------------
+-- Stops your character from sitting. forcecrim / carbring / ufo / spamcars pause it while they run.
+do
+	local out = D.logger("antisit")
+	local state = _G.DeemAntiSit
+	if type(state) ~= "table" then
+		state = { enabled = false, pauses = 0 }
+		_G.DeemAntiSit = state
+	end
+	function state.pause() state.pauses = state.pauses + 1 end
+	function state.resume() state.pauses = math.max(0, state.pauses - 1) end
+
+	local lastHum, lastBlocking
+	local function enforce()
+		local hum = getHum()
+		if not hum then return end
+		local blocking = state.enabled and state.pauses <= 0
+		if hum ~= lastHum or blocking ~= lastBlocking then
+			lastHum, lastBlocking = hum, blocking
+			pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Seated, not blocking) end)
+		end
+		if blocking and (hum.Sit or hum.SeatPart) then
+			hum.Sit = false
+			pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+		end
+	end
+	if state.conn then state.conn:Disconnect() end
+	state.conn = RunService.Heartbeat:Connect(enforce)
+
+	Commands.antisit = function(arg)
+		local a = arg and tostring(arg):lower()
+		if a == "reset" then
+			state.pauses = 0
+			enforce()
+			return out("Cleared any stuck pause (anti-sit is " .. (state.enabled and "ON" or "OFF") .. ")")
+		end
+		if a == "on" then state.enabled = true
+		elseif a == "off" then state.enabled = false
+		else state.enabled = not state.enabled end
+		enforce()
+		out("Anti-sit " .. (state.enabled and "ON" or "OFF")
+			.. (state.pauses > 0 and " (paused right now while another command is using seats)" or ""))
+	end
+end
+
+-- antiarrest ---------------------------------------------------------------------------
+-- When you get arrested (Remotes.ClientArrested fires) you're put straight back where you were standing.
+do
+	local out = D.logger("antiarrest")
+	local HISTORY_SECONDS, ARREST_LAG, RETURN_WINDOW, CLOSE_ENOUGH = 1.0, 0.25, 4.5, 4
+	local state = _G.DeemAntiArrest
+	if type(state) ~= "table" then
+		state = { enabled = false, conns = {}, history = {}, pending = nil }
+		_G.DeemAntiArrest = state
+	end
+	local function disconnectAll()
+		for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
+		table.clear(state.conns)
+	end
+	-- Position we were at ARREST_LAG seconds ago (the server may already be moving us toward the cell)
+	local function positionBeforeNow()
+		local now, pick = os.clock(), nil
+		for _, entry in ipairs(state.history) do
+			if now - entry[1] >= ARREST_LAG then pick = entry[2] end
+		end
+		return pick or (state.history[1] and state.history[1][2])
+	end
+	local function onArrested()
+		if not state.enabled or state.pending then return end
+		local cf = positionBeforeNow()
+		if not cf then return out("Arrested, but I have no saved position to return you to") end
+		state.pending = { cf = cf, untilT = os.clock() + RETURN_WINDOW }
+		out("Arrest detected - returning you to where it happened")
+	end
+	local function step()
+		local char, hum, root = lplr.Character, getHum(), lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+		local pending = state.pending
+		if pending then
+			if os.clock() > pending.untilT then
+				state.pending = nil
+				table.clear(state.history)
+			elseif root and hum and hum.Health > 0 and (root.Position - pending.cf.Position).Magnitude > CLOSE_ENOUGH then
+				if hum.SeatPart then hum.Sit = false end
+				root.AssemblyLinearVelocity = Vector3.zero
+				char:PivotTo(pending.cf)
+			end
+			return
+		end
+		if root and hum and hum.Health > 0 then
+			local now = os.clock()
+			table.insert(state.history, { now, root.CFrame })
+			while #state.history > 1 and now - state.history[1][1] > HISTORY_SECONDS do
+				table.remove(state.history, 1)
+			end
+		end
+	end
+	local function setEnabled(on)
+		disconnectAll()
+		state.pending = nil
+		table.clear(state.history)
+		state.enabled = on
+		if not on then return end
+		table.insert(state.conns, RunService.Heartbeat:Connect(step))
+		task.spawn(function()
+			local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+			local ev = remotes and remotes:WaitForChild("ClientArrested", 10)
+			if not ev then return out("Couldn't find Remotes.ClientArrested") end
+			if state.enabled then table.insert(state.conns, ev.OnClientEvent:Connect(onArrested)) end
+		end)
+	end
+	Commands.antiarrest = function(arg)
+		local a = arg and tostring(arg):lower()
+		local want = (a == "on") or (a ~= "off" and not state.enabled)
+		setEnabled(want)
+		out(want and "ON - if you get arrested you'll be teleported back to where it happened" or "OFF")
+	end
+end
+
+-- returnbydeath ------------------------------------------------------------------------
+-- Every time you die / reset you're teleported back to where you died as soon as you respawn.
+do
+	local out = D.logger("returnbydeath")
+	local RESPAWN_SETTLE, FF_APPEAR_GRACE, FF_STABLE = 0.15, 2, 0.4
+	local state = _G.DeemReturnByDeath
+	if type(state) ~= "table" then
+		state = { enabled = false, conns = {}, lastAlive = nil, lastDeath = nil }
+		_G.DeemReturnByDeath = state
+	end
+	local function getRoot(char)
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		return hum and hum.RootPart or (char and char:FindFirstChild("HumanoidRootPart"))
+	end
+	local function disconnectAll()
+		for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
+		table.clear(state.conns)
+	end
+	local function hookCharacter(char)
+		local hum = char:WaitForChild("Humanoid", 10)
+		if not hum or not state.enabled then return end
+
+		local target = state.lastDeath -- set by the previous character's Died event
+		if target then
+			task.spawn(function()
+				local root
+				local t = os.clock()
+				repeat
+					root = getRoot(char)
+					task.wait()
+				until root or os.clock() - t > 5
+				if not root or not state.enabled or lplr.Character ~= char then return end
+				task.wait(RESPAWN_SETTLE)
+				-- The team and forcefield are applied a moment AFTER the character spawns, so checking right away finds
+				-- "no forcefield" and teleports too early: give them time to show up, then wait until the forcefield is
+				-- gone AND has stayed gone for FF_STABLE seconds.
+				if D.inPrison(target.Position) then
+					local t0 = os.clock()
+					while state.enabled and lplr.Character == char and os.clock() - t0 < FF_APPEAR_GRACE do
+						local team = lplr.Team
+						if team ~= nil and team.Name == "Criminals" and char:FindFirstChildOfClass("ForceField") then break end
+						if team ~= nil and team.Name ~= "Criminals" and os.clock() - t0 > 0.5 then break end
+						task.wait(0.05)
+					end
+					local clearSince
+					while state.enabled and lplr.Character == char do
+						if D.ffGate(target.Position, out) then
+							clearSince = nil
+						else
+							clearSince = clearSince or os.clock()
+							if os.clock() - clearSince >= FF_STABLE then break end
+						end
+						task.wait(0.05)
+					end
+				end
+				if not state.enabled or lplr.Character ~= char then return end
+				if hum.SeatPart then
+					hum.Sit = false
+					task.wait(0.1)
+				end
+				root.AssemblyLinearVelocity = Vector3.zero
+				char:PivotTo(target)
+				state.lastDeath = nil
+			end)
+		end
+
+		-- Remember where we are while alive (the root part can already be gone by the time Died fires)
+		local alive = RunService.Heartbeat:Connect(function()
+			local r = getRoot(char)
+			if r and hum.Health > 0 then state.lastAlive = r.CFrame end
+		end)
+		table.insert(state.conns, alive)
+		table.insert(state.conns, hum.Died:Connect(function()
+			alive:Disconnect()
+			local r = getRoot(char)
+			state.lastDeath = r and r.CFrame or state.lastAlive
+		end))
+	end
+	Commands.returnbydeath = function(arg)
+		local a = arg and tostring(arg):lower()
+		local want = (a == "on") or (a ~= "off" and not state.enabled)
+		disconnectAll()
+		state.lastDeath = nil
+		state.enabled = want
+		if want then
+			table.insert(state.conns, lplr.CharacterAdded:Connect(hookCharacter))
+			if lplr.Character then task.spawn(hookCharacter, lplr.Character) end
+			out("ON - you'll be teleported back to where you died every time you respawn")
+		else
+			out("OFF")
+		end
+	end
+end
+
+-- silentgun ----------------------------------------------------------------------------
+-- GripPos of any gun you hold = 3000,3000,3000 so the gun (and the shots) sit far away from you.
+do
+	local out = D.logger("silentgun")
+	local GRIP = Vector3.new(3000, 3000, 3000)
+	local state = _G.DeemSilentGun
+	if type(state) ~= "table" then
+		state = { enabled = false, originals = {} }
+		_G.DeemSilentGun = state
+	end
+	local function isGun(tool)
+		return tool:IsA("Tool") and tool.Name ~= "Handcuffs" and tool:FindFirstChild("Handle") ~= nil
+			and tool:GetAttribute("FireRate") ~= nil
+	end
+	local function step()
+		if not state.enabled then return end
+		local char = lplr.Character
+		if not char then return end
+		for _, child in ipairs(char:GetChildren()) do
+			if isGun(child) then
+				pcall(function()
+					if state.originals[child] == nil then state.originals[child] = child.GripPos end
+					if child.GripPos ~= GRIP then child.GripPos = GRIP end
+				end)
+			end
+		end
+	end
+	local function restore()
+		for tool, grip in pairs(state.originals) do
+			if tool.Parent then pcall(function() tool.GripPos = grip end) end
+		end
+		table.clear(state.originals)
+	end
+	if state.conn then state.conn:Disconnect() end
+	state.conn = RunService.Heartbeat:Connect(step)
+
+	Commands.silentgun = function(arg)
+		local a = arg and tostring(arg):lower()
+		state.enabled = (a == "on") or (a ~= "off" and not state.enabled)
+		if state.enabled then
+			out("ON - any gun you equip gets GripPos 3000, 3000, 3000 (run 'silentgun' again to stop)")
+			step()
+		else
+			restore()
+			out("OFF - guns put back to normal")
+		end
+	end
+end
+
+-- headpat ------------------------------------------------------------------------------
+Commands.headpat = function(arg1)
+	local hum = getHum()
+	if not hum then return end
+	if _G.DeemHeadpatTrack then -- stop any headpat that's already playing
+		pcall(function() _G.DeemHeadpatTrack:Stop() end)
+		_G.DeemHeadpatTrack = nil
+	end
+	if arg1 and tostring(arg1):lower() == "stop" then return end
+
+	local animation = Instance.new("Animation")
+	animation.AnimationId = D.anim2track("rbxassetid://123896085")
+	local track = D.getAnimator(hum):LoadAnimation(animation)
+	track.Priority = Enum.AnimationPriority.Action
+	track.Looped = true
+	track:Play()
+	_G.DeemHeadpatTrack = track
+	local speed = tonumber(arg1) -- optional speed: "headpat 2"
+	if speed then track:AdjustSpeed(speed) end
+end
+
+-- hug / closehug / kiss (one engine) ---------------------------------------------------
+-- Loop-teleports (zero delay) in front of / behind a player, facing them, and loop-plays animations.
+do
+	local out = D.logger("pose")
+	local ACTION, ACTION2, MOVEMENT = Enum.AnimationPriority.Action, Enum.AnimationPriority.Action2, Enum.AnimationPriority.Movement
+	-- hug: looped hug + head tilt on top. kiss: played like Infinite Yield's ;anim (Movement priority, not forced to loop).
+	local POSES = {
+		hug = {
+			verb = "Hugging", defaultDistance = 1.3,
+			anims = {
+				{ id = "rbxassetid://159223413", priority = ACTION, loop = true },
+				{ id = "rbxassetid://283545583", priority = ACTION2, loop = true },
+			},
+		},
+		kiss = {
+			verb = "Kissing", defaultDistance = 1,
+			anims = {
+				{ id = "rbxassetid://159223413", priority = MOVEMENT },
+				{ id = "rbxassetid://187951261", priority = MOVEMENT },
+				{ id = "rbxassetid://283545583", priority = MOVEMENT, optional = "tilt" },
+				{ id = "rbxassetid://116690317", priority = MOVEMENT, optional = "hug" },
+			},
+		},
+	}
+
+	-- One state for all of them: starting one stops the other (they'd fight over your position otherwise)
+	local pose = _G.DeemPose
+	if type(pose) ~= "table" then
+		pose = {}
+		_G.DeemPose = pose
+	end
+
+	local function stopPose()
+		if pose.conn then pose.conn:Disconnect() pose.conn = nil end
+		for _, t in ipairs(pose.tracks or {}) do pcall(function() t:Stop() t:Destroy() end) end
+		for _, a in ipairs(pose.anims or {}) do pcall(function() a:Destroy() end) end
+		pose.tracks, pose.anims, pose.active, pose.kind = nil, nil, nil, nil
+	end
+
+	local function startPose(kind, target, distance, side, flags)
+		stopPose()
+		pose.kind = kind
+		pose.anims, pose.active = {}, {}
+		for _, info in ipairs(POSES[kind].anims) do
+			if not info.optional or flags[info.optional] then
+				local a = Instance.new("Animation")
+				a.AnimationId = D.anim2track(info.id)
+				table.insert(pose.anims, a)
+				table.insert(pose.active, info)
+			end
+		end
+		local lastHum
+		local hum0 = getHum()
+		if hum0 and hum0.SeatPart then hum0.Sit = false end -- unseat first so a seat can't hold us back
+
+		pose.conn = RunService.Heartbeat:Connect(function()
+			local char, hum, root = D.getMe()
+			local _, _, tRoot = D.getParts(target)
+			if not (char and tRoot) then return end
+			if D.ffGate(tRoot.Position, out) then return end -- Criminal + forcefield and they're in the prison
+
+			local sign = (side == "back") and -1 or 1
+			local front = tRoot.Position + tRoot.CFrame.LookVector * distance * sign
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.CFrame = CFrame.lookAt(front, Vector3.new(tRoot.Position.X, front.Y, tRoot.Position.Z))
+
+			if hum ~= lastHum then -- (re)load the animations on a new character
+				lastHum = hum
+				for _, t in ipairs(pose.tracks or {}) do pcall(function() t:Destroy() end) end
+				pose.tracks = {}
+				local animator = D.getAnimator(hum)
+				for i, a in ipairs(pose.anims) do
+					local ok, track = pcall(function() return animator:LoadAnimation(a) end)
+					if ok and track then
+						track.Priority = pose.active[i].priority
+						if pose.active[i].loop then track.Looped = true end
+						pose.tracks[i] = track
+					end
+				end
+			end
+			for _, track in pairs(pose.tracks or {}) do
+				if not track.IsPlaying then track:Play(0.1) end
+			end
+		end)
+	end
+
+	local function poseCommand(kind, label, defaultDistance, ...)
+		local args = { ... }
+		local name = args[1] and tostring(args[1])
+		if not name or name:lower() == "stop" then
+			if pose.conn then
+				stopPose()
+				return out("Stopped")
+			end
+			return out(name and "Nothing is running"
+				or ("Usage: " .. label .. " <player> [front|back] [distance]" .. (kind == "kiss" and " [tilt] [hug]" or "") .. " | " .. label .. " stop"))
+		end
+		local target = D.findPlayer(name)
+		if not target then return out("No player found for '" .. name .. "'") end
+		local side, distance, flags = "front", defaultDistance, {}
+		for i = 2, #args do
+			local a = tostring(args[i]):lower()
+			if a == "front" or a == "back" then
+				side = a
+			elseif kind == "kiss" and (a == "tilt" or a == "headtilt") then
+				flags.tilt = true
+			elseif kind == "kiss" and a == "hug" then
+				flags.hug = true
+			elseif tonumber(a) then
+				distance = math.clamp(tonumber(a), 0.5, 10)
+			end
+		end
+		startPose(kind, target, distance, side, flags)
+		out(POSES[kind].verb .. " " .. target.Name .. " from the " .. side .. (flags.tilt and " with a head tilt" or "")
+			.. " (run '" .. label .. " stop' to stop)")
+	end
+
+	Commands.hug = function(...) poseCommand("hug", "hug", POSES.hug.defaultDistance, ...) end
+	Commands.closehug = function(...) poseCommand("hug", "closehug", 1, ...) end -- same as hug, closer by default
+	Commands.kiss = function(...) poseCommand("kiss", "kiss", POSES.kiss.defaultDistance, ...) end
+
+	D.poseRunning = function(kind) return pose.conn ~= nil and pose.kind == kind end
+end
+
+-- autoc4 -------------------------------------------------------------------------------
+-- Grabs a new C4 every time you use one up, then puts you straight back where you were.
+do
+	local out = D.logger("autoc4")
+	local GONE_FOR, CHECK_INTERVAL = 0.1, 0.1
+	local state = _G.DeemAutoC4
+	if type(state) ~= "table" then
+		state = { enabled = false, loopId = 0, grabbing = false }
+		_G.DeemAutoC4 = state
+	end
+
+	local function grabAndReturn()
+		local char, _, root = D.getMe()
+		if not root then return false end
+		local home = char:GetPivot()
+		out("C4 used up - grabbing a new one")
+		local got = D.grabC4(out)
+		D.waitForForcefield(function() return home.Position end, nil, out) -- going home could be into the prison
+		local c, _, r = D.getMe()
+		if c and r then
+			for _ = 1, 3 do -- hold our speed at zero for a few frames so nothing carries us off
+				r.AssemblyLinearVelocity = Vector3.zero
+				r.AssemblyAngularVelocity = Vector3.zero
+				c:PivotTo(home)
+				RunService.Heartbeat:Wait()
+			end
+		end
+		out(got and "Got a new C4 - back where you were" or "Couldn't pick up a C4")
+		return got
+	end
+
+	local function watch(id)
+		local hadC4, goneSince, lastChar = false, nil, nil
+		while state.enabled and state.loopId == id do
+			local ok, err = pcall(function()
+				local char = D.getMe()
+				if lplr.Character ~= lastChar then -- respawn: the old C4 went with the old character
+					lastChar = lplr.Character
+					hadC4, goneSince = false, nil
+				end
+				if not char then
+					hadC4, goneSince = false, nil -- dead / respawning
+				elseif D.getC4() then
+					if not hadC4 then out("Watching your C4 - it will grab a new one when it's used up") end
+					hadC4, goneSince = true, nil
+				elseif type(_G.DeemBusy) == "table" and _G.DeemBusy.tpbomb == true then
+					goneSince = nil -- let the bomb command finish its trip first
+				elseif hadC4 then
+					goneSince = goneSince or os.clock()
+					if os.clock() - goneSince >= GONE_FOR then
+						goneSince = nil
+						state.grabbing = true
+						D.setBusy("autoc4", true) -- the stand holds off while we're teleporting around
+						local okGrab, err2 = pcall(grabAndReturn)
+						D.setBusy("autoc4", false)
+						state.grabbing = false
+						if not okGrab then out("Error: " .. tostring(err2)) end
+						hadC4 = D.getC4() ~= nil
+					end
+				end
+			end)
+			if not ok then out("Error: " .. tostring(err)) end
+			task.wait(CHECK_INTERVAL)
+		end
+	end
+
+	Commands.autoc4 = function(arg)
+		local a = arg and tostring(arg):lower()
+		local want = (a == "on") or (a ~= "off" and not state.enabled)
+		state.loopId += 1 -- stops any loop that's already running
+		state.enabled = want
+		if want then
+			task.spawn(watch, state.loopId)
+			out("ON - after you use up a C4 it will grab a new one and bring you back (run 'autoc4' again to stop)")
+			if not D.getC4() then out("You don't have a C4 yet - it starts watching once you do (tpbomb gets you one)") end
+		else
+			out("OFF")
+		end
+	end
+end
+
+-- arrestall ----------------------------------------------------------------------------
+-- Teleports to every Criminal (except your Roblox friends) and arrests them, then goes back.
+do
+	local out = D.logger("arrestall")
+	local ARREST_COOLDOWN, TRY_INTERVAL, MAX_TRIES, MAX_WAIT, TASE_WAIT = 7, 0.1, 25, 90, 0.6
+	local STAND_OFFSET = Vector3.new(3, 1, 0)
+	local VOID_Y = math.max(workspace.FallenPartsDestroyHeight + 150, -400)
+	local busy, cancelled = false, false
+	local skipped = {}
+
+	local function isCriminal(p) return p ~= lplr and p.Team and p.Team.Name == "Criminals" end
+	local function targetRoot(p)
+		local r, c = select(3, D.getParts(p)), p.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if r and h and h.Health > 0 then return r, c end
+	end
+	-- A criminal with a forcefield can't be arrested: wait until it's gone before going after them
+	local function isProtected(p)
+		local r, c = targetRoot(p)
+		return r ~= nil and c:FindFirstChildOfClass("ForceField") ~= nil
+	end
+	local function nextTarget()
+		local _, _, myRoot = D.getMe()
+		local best, bestDist, waiting = nil, nil, 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			if isCriminal(p) and not D.isFriend(p) and not skipped[p] then
+				local r, c = targetRoot(p)
+				if r and not c:GetAttribute("Arrested") then
+					if isProtected(p) then
+						waiting += 1
+					else
+						local d = myRoot and (r.Position - myRoot.Position).Magnitude or 0
+						if not bestDist or d < bestDist then best, bestDist = p, d end
+					end
+				end
+			end
+		end
+		return best, waiting
+	end
+	local function equip(name)
+		local char, hum = D.getMe()
+		if not hum then return nil end
+		local tool = char:FindFirstChild(name)
+		if tool and tool:IsA("Tool") then return tool end
+		local bp = lplr:FindFirstChildWhichIsA("Backpack")
+		tool = bp and bp:FindFirstChild(name)
+		if tool and tool:IsA("Tool") then
+			hum:EquipTool(tool)
+			return tool
+		end
+	end
+	-- Handcuffs must actually be in the character (equipping takes a moment), or the server ignores the arrest
+	local function holdCuffs()
+		local tool = equip("Handcuffs")
+		if not tool then return nil end
+		local t = os.clock()
+		while tool.Parent ~= lplr.Character and os.clock() - t < 1 do task.wait() end
+		return tool.Parent == lplr.Character and tool or nil
+	end
+	-- Like a zero-delay loopgoto: snaps to the target every frame so a moving target can't get away
+	local followConn
+	local function followStart(p)
+		if followConn then followConn:Disconnect() end
+		followConn = RunService.Heartbeat:Connect(function()
+			local _, _, myRoot = D.getMe()
+			local r = targetRoot(p)
+			if myRoot and r then
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.CFrame = r.CFrame + STAND_OFFSET
+			end
+		end)
+	end
+	local function followStop()
+		if followConn then followConn:Disconnect() followConn = nil end
+	end
+
+	local function run(useTase)
+		local remote = D.remote("ArrestPlayer")
+		if not remote then return 0, "Couldn't find the ArrestPlayer remote" end
+		local char = D.getMe()
+		if not char then return 0, "Your character isn't ready" end
+		if lplr.Team and lplr.Team.Name ~= "Guards" then
+			out("Warning: you're on " .. lplr.Team.Name .. ", the server probably only lets Guards arrest")
+		end
+		local home = char:GetPivot()
+		local arrested, nextArrestAt = 0, 0
+		table.clear(skipped)
+		local waitStart, announcedWait = os.clock(), false
+
+		while not cancelled do
+			local _, _, myRoot = D.getMe()
+			if not myRoot then
+				task.wait(0.5)
+			elseif myRoot.Position.Y < VOID_Y then
+				out("Stopped: you fell below the map")
+				break
+			elseif os.clock() < nextArrestAt then
+				task.wait(0.1) -- the game makes you wait after each arrest
+			else
+				local target, waiting = nextTarget()
+				if not target then
+					if waiting > 0 and os.clock() - waitStart < MAX_WAIT then
+						if not announcedWait then
+							announcedWait = true
+							out("Waiting for " .. waiting .. " criminal(s) with a forcefield to lose it")
+						end
+						task.wait(0.25)
+					else
+						break
+					end
+				else
+					waitStart, announcedWait = os.clock(), false
+					local cuffs = holdCuffs()
+					if not cuffs then
+						out("No Handcuffs found in your inventory - are you a Guard?")
+						break
+					end
+					local lc = lplr.Character
+					local lastPos = lc and lc:GetPivot() or home -- we come back here after this arrest
+					followStart(target)
+					local lastRes, tries, done, taseTried = nil, 0, false, false
+					while not cancelled and not done and tries < MAX_TRIES do
+						local r, c = targetRoot(target)
+						if not r or not isCriminal(target) or c:GetAttribute("Arrested") or isProtected(target) then break end
+						if useTase and not taseTried and not c:GetAttribute("Tased") then
+							taseTried = true
+							local taser = equip("Taser")
+							if taser then
+								pcall(function() taser:Activate() end)
+								task.wait(TASE_WAIT)
+								cuffs = holdCuffs() or cuffs
+							end
+						end
+						if os.clock() >= nextArrestAt then
+							tries += 1
+							local ok, res = pcall(function() return remote:InvokeServer(target, 1) end)
+							lastRes = ok and tostring(res) or ("error: " .. tostring(res))
+							if ok and res then
+								arrested += 1
+								nextArrestAt = os.clock() + ARREST_COOLDOWN
+								out("Arrested " .. target.Name)
+								done = true
+							end
+						end
+						task.wait(TRY_INTERVAL)
+					end
+					followStop()
+					local c2 = lplr.Character
+					if c2 and c2:FindFirstChild("HumanoidRootPart") then
+						c2.HumanoidRootPart.AssemblyLinearVelocity = Vector3.zero
+						pcall(function() c2:PivotTo(lastPos) end)
+					end
+					if not done then
+						local _, c = targetRoot(target)
+						if not (c and c:GetAttribute("Arrested")) and isCriminal(target) and not isProtected(target) then
+							skipped[target] = true
+							out("Couldn't arrest " .. target.Name .. ", skipping (server answered: " .. tostring(lastRes) .. ")")
+						end
+					end
+				end
+			end
+		end
+		followStop()
+		local c = lplr.Character
+		if c and c:FindFirstChild("HumanoidRootPart") then pcall(function() c:PivotTo(home) end) end
+		return arrested
+	end
+
+	Commands.arrestall = function(...)
+		local arg = ({ ... })[1] and tostring(({ ... })[1]):lower()
+		if arg == "stop" then
+			if busy then
+				cancelled = true
+				return out("Stopping...")
+			end
+			return out("Nothing is running")
+		end
+		if busy then return out("Already running, use 'arrestall stop' to stop it") end
+		busy, cancelled = true, false
+		task.spawn(function()
+			local ok, n, err = pcall(run, arg == "tase")
+			if not ok then out("Error: " .. tostring(n))
+			elseif err then out(err)
+			else out("Finished: " .. tostring(n) .. " arrested") end
+			busy, cancelled = false, false
+		end)
+	end
+end
+
+-- tpbomb / autotpbomb (one bomb routine) -----------------------------------------------
+-- tpbomb <player>        one bomb: grab C4, place it under them, jump 80+ studs away, detonate, come back
+-- autotpbomb <player>    the same over and over (waits out forcefields, hops team if you share theirs)
+-- Both: "<cmd> stop" stops it.
+do
+	local out = D.logger("tpbomb")
+	local PLACE_SETTLE, PLACE_TRIES, PLACE_RETRY_WAIT = 0.15, 6, 0.12
+	local SAFE_DISTANCE = 80 -- the blast is well inside this
+	local STAND_OFFSET = Vector3.zero -- directly inside the target so no wall can block the placement
+
+	local state = _G.DeemTpBomb
+	if type(state) ~= "table" then
+		state = { busy = false, cancelled = false, mode = nil }
+		_G.DeemTpBomb = state
+	end
+	local cancelled = function() return state.cancelled end
+
+	local function bombPosition(obj, fallback)
+		if typeof(obj) == "Instance" then
+			if obj:IsA("BasePart") then return obj.Position end
+			if obj:IsA("Model") then return obj:GetPivot().Position end
+		end
+		return fallback
+	end
+
+	-- Somewhere at least SAFE_DISTANCE from the bomb: home if far enough, else the C4 giver, else high in the air
+	local function goSafe(bombPos, home)
+		local c, _, r = D.getMe()
+		if not r then return false end
+		local candidates = {
+			{ pos = home.Position },
+			{ pos = D.GIVER_POS },
+			{ pos = bombPos + Vector3.new(0, 300, 0), air = true },
+			{ pos = bombPos + Vector3.new(500, 300, 0), air = true },
+		}
+		local chosen, farthest, farthestD
+		for _, cand in ipairs(candidates) do
+			local d = (cand.pos - bombPos).Magnitude
+			if d >= SAFE_DISTANCE and not D.ffBlocks(cand.pos) then
+				chosen = cand
+				break
+			end
+			if not farthestD or d > farthestD then farthest, farthestD = cand, d end
+		end
+		chosen = chosen or farthest
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+		if chosen.air then r.Anchored = true end
+		c:PivotTo(CFrame.new(chosen.pos))
+		return true
+	end
+
+	local function unanchor()
+		local char = lplr.Character
+		local r = char and char:FindFirstChild("HumanoidRootPart")
+		if r then pcall(function() r.Anchored = false end) end
+	end
+
+	-- Sticks us to the target every frame (zero-delay loopgoto)
+	local followConn
+	local function followStart(target)
+		if followConn then followConn:Disconnect() end
+		followConn = RunService.Heartbeat:Connect(function()
+			local _, _, myRoot = D.getMe()
+			local _, _, tr = D.getParts(target)
+			if myRoot and tr then
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.CFrame = tr.CFrame + STAND_OFFSET
+			end
+		end)
+	end
+	local function followStop()
+		if followConn then followConn:Disconnect() followConn = nil end
+	end
+
+	-- One full cycle. Returns true, or false + the reason.
+	local function bombOnce(target)
+		local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+		local c4remotes = remotes and remotes:FindFirstChild("C4")
+		local activate = c4remotes and c4remotes:FindFirstChild("ActivateC4")
+		if not activate then return false, "Couldn't find the C4 remotes" end
+
+		local char, _, root = D.getMe()
+		if not root then return false, "Your character isn't ready" end
+		local home = char:GetPivot()
+
+		local function bail(why)
+			followStop()
+			unanchor()
+			pcall(function() D.unequip() end)
+			local c = lplr.Character
+			if c then pcall(function() c:PivotTo(home) end) end
+			return false, why
+		end
+
+		if not D.getC4() and not D.grabC4(out) then return bail("Couldn't pick up a C4") end
+		if not D.equipC4() then return bail("Couldn't equip the C4") end
+
+		local _, _, tRoot = D.getParts(target)
+		if not tRoot then return bail(target.Name .. " has no character") end
+
+		-- Criminal + forcefield and the target is in the prison: wait for the forcefield to drop first
+		D.waitForForcefield(function()
+			local _, _, tr = D.getParts(target)
+			return tr and tr.Position
+		end, cancelled, out)
+
+		local _, _, r = D.getMe()
+		if not r then return false, "You died" end
+		r.AssemblyLinearVelocity = Vector3.zero
+		followStart(target)
+		task.wait(PLACE_SETTLE) -- let the server see where we are
+
+		local _, _, tr0 = D.getParts(target)
+		if not tr0 then return bail(target.Name .. " left / died") end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { lplr.Character, target.Character }
+		local floorPos = tr0.Position - Vector3.new(0, 3, 0)
+
+		-- The server rejects a placement if it hasn't caught up with where you are yet, so retry with fresh positions
+		local ok, placed, bombObj
+		for attempt = 1, PLACE_TRIES do
+			local _, _, r2 = D.getMe()
+			local _, _, tr2 = D.getParts(target)
+			if not (r2 and tr2) then break end
+			if attempt > 1 then task.wait(PLACE_RETRY_WAIT) end
+			local ray = workspace:Raycast(tr2.Position, Vector3.new(0, -30, 0), params)
+			floorPos = ray and ray.Position or (tr2.Position - Vector3.new(0, 3, 0))
+			local origin = tr2.Position -- we're sitting on them, so this is their position
+			ok, placed, bombObj = pcall(function() return activate:InvokeServer(origin, floorPos) end)
+			if ok and placed then break end
+		end
+		if not ok or not placed then
+			return bail("The server didn't let the C4 be placed (" .. tostring(placed) .. ")")
+		end
+		followStop()
+
+		-- GET AWAY FIRST, then detonate from a safe distance so the blast can never reach you
+		local placedBomb = (typeof(bombObj) == "Instance" and bombObj) or workspace:FindFirstChild("ServerC4")
+		local bombPos = bombPosition(placedBomb, floorPos)
+		goSafe(bombPos, home)
+
+		local exploded = false
+		local function fire()
+			task.spawn(function() pcall(function() activate:InvokeServer() end) end)
+		end
+		local started, lastReequip = os.clock(), 0
+		while os.clock() - started < 6 do
+			local _, _, mr = D.getMe()
+			if not mr then break end
+			if (mr.Position - bombPos).Magnitude < SAFE_DISTANCE then
+				goSafe(bombPos, home) -- somehow too close: move away, and don't detonate this frame
+			else
+				fire() -- sent every frame instead of waiting on each answer
+				if placedBomb and not placedBomb.Parent then
+					exploded = true
+					break
+				end
+				if not placedBomb and os.clock() - started > 1 then break end
+			end
+			-- It tends to go off after a fresh re-equip, so cycle the tool quickly while still firing
+			if os.clock() - lastReequip > 0.08 then
+				lastReequip = os.clock()
+				local _, hum = D.getMe()
+				local tool = D.getC4()
+				if hum and tool then
+					if tool.Parent == lplr.Character then
+						hum:UnequipTools()
+					else
+						hum:EquipTool(tool)
+						pcall(function() tool:Activate() end)
+					end
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		out(exploded and ("Detonated C4 on " .. target.Name)
+			or ("Sent the detonate call " .. (placedBomb and "but the bomb is still there" or "(couldn't track the bomb)")))
+
+		task.wait(0.1)
+		unanchor()
+		D.unequip()
+		D.waitForForcefield(function() return home.Position end, cancelled, out) -- going home could be into the prison
+		local c = lplr.Character
+		if c then pcall(function() c:PivotTo(home) end) end
+		return true
+	end
+
+	-- Team hopping (autotpbomb) ---------------------------------------------------------
+	local teamCooldown = 0
+	local function pickTeam(button)
+		if teamCooldown < os.clock() then
+			pcall(function() firesignal(button.MouseButton1Click) end)
+			teamCooldown = os.clock() + 0.1
+		end
+	end
+	-- Joins any team button that isn't the target's team. Returns true if our team changed.
+	local function hopTeam(avoid)
+		local pg = lplr:FindFirstChild("PlayerGui")
+		local gui = pg and pg:FindFirstChild("TeamsFrame", true)
+		if not gui then
+			out("Couldn't find the team picker (TeamsFrame)")
+			return false
+		end
+		local avoidName = avoid and avoid.Name:lower() or nil
+		local preferred, fallback = {}, {}
+		for _, holder in ipairs(gui:GetChildren()) do
+			local btn = holder:FindFirstChild("Button")
+			if btn and btn.AutoButtonColor then
+				-- The label says "Guard" / "Inmate" while the teams are "Guards" / "Inmates": compare both directions
+				local isAvoid = false
+				if avoidName then
+					for _, d in ipairs(holder:GetDescendants()) do
+						if d:IsA("TextLabel") or d:IsA("TextButton") then
+							local text = d.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+							if #text >= 3 and (avoidName:find(text, 1, true) or text:find(avoidName, 1, true)) then
+								isAvoid = true
+							end
+						end
+					end
+				end
+				table.insert(isAvoid and fallback or preferred, btn)
+			end
+		end
+		for _, btn in ipairs(fallback) do table.insert(preferred, btn) end
+
+		local before = lplr.Team
+		for _, btn in ipairs(preferred) do
+			if state.cancelled then return false end
+			pickTeam(btn)
+			local t = os.clock()
+			while lplr.Team == before and os.clock() - t < 3 do task.wait(0.1) end
+			if lplr.Team ~= before and lplr.Team ~= avoid then
+				local w = os.clock() -- a team change comes with a respawn
+				while not D.getMe() and os.clock() - w < 10 do task.wait(0.2) end
+				return true
+			end
+			before = lplr.Team
+		end
+		return false
+	end
+
+	local function runAuto(target)
+		local lastMsg, bombs = nil, 0
+		local function say(msg)
+			if msg ~= lastMsg then lastMsg = msg out(msg) end
+		end
+		while not state.cancelled do
+			if not target.Parent then
+				say(target.Name .. " left the game")
+				break
+			end
+			if lplr.Team == nil or lplr.Team.Name == "Neutral" or (target.Team ~= nil and lplr.Team == target.Team) then
+				say("Same team as " .. target.Name .. " - switching team")
+				if not hopTeam(target.Team) then
+					say("Couldn't switch teams, retrying")
+					task.wait(1)
+				end
+			else
+				local tChar, tHum, tRoot = D.getParts(target)
+				if not (tRoot and tHum) or tHum.Health <= 0 then
+					say("Waiting for " .. target.Name .. " to respawn")
+					task.wait(0.5)
+				elseif tChar:FindFirstChildOfClass("ForceField") then
+					say("Waiting for " .. target.Name .. "'s forcefield to drop")
+					task.wait(0.25)
+				elseif not D.getMe() then
+					task.wait(0.5)
+				else
+					lastMsg = nil
+					local ok, why = bombOnce(target)
+					if ok then
+						bombs += 1
+						task.wait(0.3)
+					else
+						say("Bomb failed: " .. tostring(why))
+						task.wait(1)
+					end
+				end
+			end
+		end
+		return bombs
+	end
+
+	local function start(mode, ...)
+		local name = ({ ... })[1] and tostring(({ ... })[1])
+		if name and name:lower() == "stop" then
+			if state.busy then
+				state.cancelled = true
+				return out("Stopping...")
+			end
+			return out("Nothing is running")
+		end
+		if not name then return out("Usage: " .. mode .. " <player> | " .. mode .. " stop") end
+		if state.busy then return out("Already running (" .. tostring(state.mode) .. "), use '" .. state.mode .. " stop' to stop it") end
+		local target = D.findPlayer(name)
+		if not target then return out("No player found for '" .. name .. "'") end
+
+		state.busy, state.cancelled, state.mode = true, false, mode
+		D.setBusy("tpbomb", true) -- autoc4 and the stand hold off while this runs
+		if mode == "autotpbomb" then out("Bombing " .. target.Name .. " until you run 'autotpbomb stop'") end
+		task.spawn(function()
+			local ok, res
+			if mode == "autotpbomb" then
+				ok, res = pcall(runAuto, target)
+				if ok then out("Stopped after " .. tostring(res) .. " bomb" .. (res == 1 and "" or "s")) end
+			else
+				ok, res = pcall(function()
+					local good, why = bombOnce(target)
+					if not good then out(tostring(why)) end
+				end)
+			end
+			if not ok then out("Error: " .. tostring(res)) end
+			followStop()
+			unanchor()
+			state.busy, state.cancelled, state.mode = false, false, nil
+			D.setBusy("tpbomb", false)
+		end)
+	end
+
+	Commands.tpbomb = function(...) start("tpbomb", ...) end
+	Commands.autotpbomb = function(...) start("autotpbomb", ...) end
+	D.bombRunning = function() return state.busy end
+end
+
+-- ufo ----------------------------------------------------------------------------------
+-- Takes a car and hovers it over a player, then (when you say so) lowers onto them and carries them to the sky / void.
+--   ufo <player>  |  ufo void|sky [speed] [lowerSpeed]  |  ufo stop
+do
+	local out = D.logger("ufo")
+	local HOVER_HEIGHT, HOVER_TIME = 30, 1.5
+	local DEFAULT_SPEED, DEFAULT_LOWER = 80, 8
+	local VOID_Y, SKY_Y = -500, 500
+	local MAX_RETRIES, JOB_TIMEOUT, SPIN_SPEED = 6, 180, 12
+
+	local state = _G.DeemUfo
+	if type(state) ~= "table" then
+		state = { busy = false, cancelled = false }
+		_G.DeemUfo = state
+	end
+	local cancelled = function() return state.cancelled end
+
+	local function run(target)
+		if lplr.Team == nil or lplr.Team.Name == "Neutral" then
+			return out("Pick a team first - you can't spawn cars while on the Neutral team")
+		end
+		local char = D.getMe()
+		if not char then return out("Your character isn't ready") end
+		local home = char:GetPivot()
+		local function goHome() pcall(function() (lplr.Character or char):PivotTo(home) end) end
+
+		out("Getting a car...")
+		local car, why = D.spawnCar(out, cancelled)
+		if not car then
+			goHome()
+			return out(why or "Couldn't get a car")
+		end
+		local body = car:WaitForChild("Body", 5)
+		local driver = body and body:WaitForChild("VehicleSeat", 5)
+		local passSeat = body and body:FindFirstChild("Seat")
+		if not (driver and passSeat) then
+			goHome()
+			return out("The car has no driver / passenger seat")
+		end
+		-- The driver seat is what gives us control of the car
+		if not D.sitIn(driver, 3) then
+			goHome()
+			return out("Couldn't sit in the car")
+		end
+		local wheels = car:FindFirstChild("Wheels") -- wheels make the car tilt and bounce
+		if wheels then pcall(function() wheels:Destroy() end) end
+
+		-- The seats are welded, so this offset never changes; we set the car's exact CFrame every frame from it
+		local driverRel = passSeat.CFrame:ToObjectSpace(driver.CFrame)
+		local yaw, lastSpin = 0, os.clock()
+		local function placeSeat(pos)
+			local now = os.clock()
+			yaw = (yaw + SPIN_SPEED * (now - lastSpin)) % (math.pi * 2)
+			lastSpin = now
+			driver.CFrame = (CFrame.new(pos) * CFrame.Angles(0, yaw, 0)) * driverRel
+			driver.AssemblyLinearVelocity = Vector3.zero
+			driver.AssemblyAngularVelocity = Vector3.zero
+		end
+		local function targetInCar()
+			local _, th = select(2, D.getParts(target))
+			return th and th.SeatPart and th.SeatPart:IsDescendantOf(car)
+		end
+
+		out("Hovering over " .. target.Name .. " - run 'ufo void' or 'ufo sky' to pick them up")
+		local phase, h, hoverUntil = "hover", HOVER_HEIGHT, 0
+		local mode, speed, lowerSpeed
+		state.order = nil
+		local retries, start = 0, os.clock()
+		local carryPos, result
+
+		while not result do
+			local dt = RunService.Heartbeat:Wait()
+			local _, myHum = D.getMe()
+			if state.cancelled then result = "stopped"
+			elseif mode and os.clock() - start > JOB_TIMEOUT then result = "timed out"
+			elseif not car.Parent or not driver.Parent then result = "the car was deleted"
+			elseif not myHum then result = "you died"
+			elseif myHum.SeatPart ~= driver then result = "you were knocked out of the car"
+			else
+				local _, tHum, tRoot = D.getParts(target)
+				if not tRoot or not tHum or tHum.Health <= 0 then
+					result = target.Name .. " left / died"
+				elseif D.ffGate(tRoot.Position, out) then
+					driver.AssemblyLinearVelocity = Vector3.zero -- hold the car still until the forcefield is gone
+					driver.AssemblyAngularVelocity = Vector3.zero
+				elseif phase == "hover" then
+					placeSeat(tRoot.Position + Vector3.new(0, h, 0))
+					if state.order and not mode then
+						mode, speed, lowerSpeed = state.order.mode, state.order.speed, state.order.lowerSpeed
+						hoverUntil = os.clock() + HOVER_TIME
+						start = os.clock()
+						out("Going for " .. target.Name .. " (" .. mode .. ")")
+					end
+					if mode and os.clock() >= hoverUntil then phase = "lower" end
+				elseif phase == "lower" then
+					h -= lowerSpeed * dt
+					placeSeat(tRoot.Position + Vector3.new(0, h, 0))
+					if targetInCar() then
+						phase, carryPos = "carry", passSeat.Position
+						out(target.Name .. " is in the car - carrying them " .. (mode == "void" and "to the void" or "to the sky"))
+					elseif h < -2 then -- missed: go back up and try again
+						retries += 1
+						if retries > MAX_RETRIES then
+							result = "couldn't get " .. target.Name .. " into the car"
+						else
+							phase, h, hoverUntil = "hover", HOVER_HEIGHT * 0.5, os.clock() + 0.5
+						end
+					end
+				elseif phase == "carry" then
+					if not targetInCar() then
+						phase, h, hoverUntil = "hover", HOVER_HEIGHT * 0.5, os.clock() + 0.5
+					else
+						local destY = mode == "void" and VOID_Y or SKY_Y
+						local y = carryPos.Y
+						y = y + math.clamp(destY - y, -speed * dt, speed * dt)
+						carryPos = Vector3.new(carryPos.X, y, carryPos.Z)
+						placeSeat(carryPos)
+						if y == destY then result = "done" end
+					end
+				end
+			end
+		end
+
+		D.standUp() -- the target stays in the car at the destination
+		goHome()
+		if result == "done" then
+			out("Delivered " .. target.Name .. " to Y = " .. (mode == "void" and VOID_Y or SKY_Y))
+		else
+			out("Stopped: " .. result)
+		end
+	end
+
+	Commands.ufo = function(...)
+		local args = { ... }
+		local first = args[1] and tostring(args[1])
+		if first and first:lower() == "stop" then
+			if state.busy then
+				state.cancelled = true
+				return out("Stopping...")
+			end
+			return out("Nothing is running")
+		end
+		if not first then return out("Usage: ufo <player>, then ufo void / ufo sky") end
+		local low = first:lower()
+		if low == "void" or low == "sky" then
+			if not state.busy then return out("Start it first with: ufo <player>") end
+			if state.order then return out("Already going for them") end
+			state.order = {
+				mode = low,
+				speed = math.clamp(tonumber(args[2]) or DEFAULT_SPEED, 1, 2000),
+				lowerSpeed = math.clamp(tonumber(args[3]) or DEFAULT_LOWER, 0.5, 200),
+			}
+			return
+		end
+		if state.busy then return out("Already running, use 'ufo stop' to stop it") end
+		local target = D.findPlayer(first)
+		if not target then return out("No player found for '" .. first .. "'") end
+
+		state.busy, state.cancelled, state.order = true, false, nil
+		task.spawn(function()
+			local paused = D.pauseAntiSit()
+			local ok, err = pcall(run, target)
+			if not ok then out("Error: " .. tostring(err)) end
+			D.resumeAntiSit(paused)
+			state.busy, state.cancelled, state.order = false, false, nil
+		end)
+	end
+	D.ufoRunning = function() return state.busy end
+end
+
+-- spamcars -----------------------------------------------------------------------------
+-- Spawns cars from EVERY "Car Spawner" and brings each one to you (or to another player). Cars only, no passengers.
+--   spamcars [count] [player] [existing|new|all] | spamcars test[N] | spamcars stop
+do
+	local out = D.logger("spamcars")
+	local MAX_CARS, TEST_DELETIONS, PILE_SKIP_RADIUS, GIVE_UP_AFTER, SIT_TIMEOUT = 500, 3, 70, 30, 2
+	local VOID_Y = math.max(workspace.FallenPartsDestroyHeight + 150, -400)
+
+	local state = _G.DeemSpamcars
+	if type(state) ~= "table" then
+		state = { busy = false, cancelled = false }
+		_G.DeemSpamcars = state
+	end
+	local cancelled = function() return state.cancelled end
+
+	-- Sits in the car (so we control it), moves it to `drop`, and gets out
+	local function bringCar(car, drop)
+		local _, hum = D.getMe()
+		if not hum then return false, "your character isn't ready" end
+		local body = car:WaitForChild("Body", 5)
+		local seat = body and body:WaitForChild("VehicleSeat", 5)
+		if not seat then return false, "the car has no driver seat" end
+
+		D.waitForForcefield(function() return seat.Position end, cancelled, out) -- car may be inside the prison
+		if state.cancelled then return false, "stopped" end
+		if not D.sitIn(seat, SIT_TIMEOUT) then
+			return false, seat.Parent and "couldn't sit in the car" or "the car was deleted"
+		end
+		D.waitForForcefield(function() return drop.Position end, cancelled, out)
+		car:PivotTo(drop) -- we're seated, so the car moves with us and we control it
+		task.wait(0.1)
+		seat.AssemblyLinearVelocity = Vector3.zero
+		seat.AssemblyAngularVelocity = Vector3.zero
+		D.standUp()
+		return true
+	end
+
+	local function run(count, followPlayer, mode, testTarget)
+		local remote = D.remote("InteractWithItem")
+		local container = workspace:FindFirstChild("CarContainer")
+		if not (remote and container) then out("Couldn't find the car remote / CarContainer") return 0 end
+		if D.isNeutral(lplr) then out("Pick a team first - you can't spawn cars while on the Neutral team") return 0 end
+		local spawners = D.getSpawners()
+		if #spawners == 0 and mode ~= "existing" then out("No parts named 'Car Spawner' found") return 0 end
+		local myChar = D.getMe()
+		if not myChar then out("Your character isn't ready") return 0 end
+		local home = myChar:GetPivot()
+
+		out("Using " .. #spawners .. " car spawner" .. (#spawners == 1 and "" or "s") .. ", bringing cars to "
+			.. (followPlayer and (followPlayer.Name .. "'s location") or "your location") .. " (run 'spamcars stop' to stop)")
+
+		local made, failures, lastMade, stopReason = 0, 0, os.clock(), nil
+		local handled = {} -- cars already dealt with: never grabbed twice
+
+		-- Spreads cars around the target in a golden-angle spiral so they don't stack on one spot
+		local function dropCFrame(index)
+			local base = home
+			if followPlayer then
+				local _, _, r = D.getParts(followPlayer)
+				if not r then return nil end
+				base = r.CFrame
+			end
+			local slot = index % 40
+			local angle = slot * 2.399963
+			local radius = math.min(60, 8 + 2.5 * math.sqrt(slot))
+			return CFrame.new(base.Position) * CFrame.new(math.cos(angle) * radius, 4, math.sin(angle) * radius)
+		end
+
+		local function noteFailure(prefix, err)
+			failures += 1
+			if failures <= 3 then out(prefix .. tostring(err)) end
+		end
+
+		-- Grabs cars that exist right now (not occupied, not already in the pile). Returns a stop reason or nil.
+		local function grabExisting()
+			local _, _, pr = followPlayer and D.getParts(followPlayer)
+			local pileBase = pr and pr.Position or home.Position
+			local _, _, myRoot = D.getMe()
+			local mePos = myRoot and myRoot.Position or home.Position
+			local existing = {}
+			for _, car in ipairs(container:GetChildren()) do
+				local seat = car:FindFirstChild("Body") and car.Body:FindFirstChild("VehicleSeat")
+				if seat and not handled[car] and not seat.Occupant and (seat.Position - pileBase).Magnitude > PILE_SKIP_RADIUS then
+					table.insert(existing, car)
+				end
+			end
+			table.sort(existing, function(a, b)
+				return (a:GetPivot().Position - mePos).Magnitude < (b:GetPivot().Position - mePos).Magnitude
+			end)
+			if #existing > 0 then out("Grabbing " .. #existing .. " existing car" .. (#existing == 1 and "" or "s")) end
+			for _, car in ipairs(existing) do
+				handled[car] = true
+				if state.cancelled then return "stopped" end
+				if made >= count then return "done" end
+				local _, _, r = D.getMe()
+				if r and r.Position.Y < VOID_Y then return "you fell below the map" end
+				local seat = car.Parent and car:FindFirstChild("Body") and car.Body:FindFirstChild("VehicleSeat")
+				if seat and not seat.Occupant then
+					local drop = dropCFrame(made)
+					if not drop then return "the player you're bringing cars to is gone" end
+					local ok, err = bringCar(car, drop)
+					if ok then made += 1 lastMade = os.clock() else noteFailure("Couldn't bring an existing car: ", err) end
+				end
+			end
+		end
+
+		-- TEST MODE: wait for the server to wipe the cars, then spawn and count how many it deletes
+		local testStats
+		if testTarget then
+			mode = "new"
+			local removedTimes = {}
+			local removeConn = container.ChildRemoved:Connect(function() table.insert(removedTimes, os.clock()) end)
+			out("TEST: waiting for the server to wipe the cars... (run 'spamcars stop' to cancel)")
+			local waitStart, hadCars, wiped = os.clock(), #container:GetChildren() > 0, false
+			while not wiped and not state.cancelled do
+				task.wait(0.1)
+				if #container:GetChildren() > 0 then hadCars = true end
+				local recent = 0
+				for _, t in ipairs(removedTimes) do
+					if os.clock() - t <= 3 then recent += 1 end
+				end
+				if (hadCars and #container:GetChildren() == 0 and #removedTimes > 0) or recent >= 5 then wiped = true end
+			end
+			if state.cancelled then
+				removeConn:Disconnect()
+				stopReason = "stopped"
+			else
+				out("TEST: the server wiped the cars after " .. string.format("%.1f", os.clock() - waitStart)
+					.. "s - spawning now, will stop after " .. testTarget .. " get deleted")
+				table.clear(removedTimes)
+				testStats = { conn = removeConn, times = removedTimes, started = os.clock() }
+			end
+		end
+
+		if mode ~= "new" and not stopReason then
+			stopReason = grabExisting()
+			if mode == "existing" and not stopReason then stopReason = "done" end
+		end
+
+		while not stopReason do
+			local brought = false
+			for _, spawner in ipairs(spawners) do
+				if state.cancelled then stopReason = "stopped" break end
+				if made >= count then stopReason = "done" break end
+				if testStats and #testStats.times >= testTarget then stopReason = "test finished" break end
+				local _, _, root = D.getMe()
+				if not root then
+					task.wait(0.5) -- respawning
+				elseif root.Position.Y < VOID_Y then
+					stopReason = "you fell below the map"
+					break
+				else
+					local car = D.spawnAt(spawner, remote, container) -- (cooldown: just move on to the next spawner)
+					if car then
+						handled[car] = true
+						local drop = dropCFrame(made)
+						if not drop then stopReason = "the player you're bringing cars to is gone" break end
+						local ok, err = bringCar(car, drop)
+						if ok then made += 1 brought = true lastMade = os.clock() else noteFailure("Couldn't bring a car: ", err) end
+					end
+				end
+			end
+			-- "all": between rounds also pick up any other cars that showed up
+			if not stopReason and mode == "all" then stopReason = grabExisting() end
+			if not stopReason then
+				if os.clock() - lastMade > GIVE_UP_AFTER then
+					stopReason = "no car was brought for " .. GIVE_UP_AFTER .. "s"
+				elseif not brought then
+					task.wait(0.1) -- every spawner is on cooldown: don't spin
+				end
+			end
+		end
+
+		if testStats then
+			testStats.conn:Disconnect()
+			local n = #testStats.times
+			local firstAt = testStats.times[1] and (testStats.times[1] - testStats.started)
+			local lastAt = testStats.times[n] and (testStats.times[n] - testStats.started)
+			out("TEST RESULT: brought " .. made .. " car" .. (made == 1 and "" or "s") .. ", the server deleted " .. n
+				.. (firstAt and (" (first after " .. string.format("%.1f", firstAt) .. "s, last after " .. string.format("%.1f", lastAt) .. "s)") or ""))
+			if stopReason == "test finished" then stopReason = "done" end
+		end
+
+		D.standUp()
+		D.waitForForcefield(function() return home.Position end, cancelled, out)
+		local c = lplr.Character
+		if c and c:FindFirstChild("HumanoidRootPart") then pcall(function() c:PivotTo(home) end) end
+		if stopReason ~= "done" and stopReason ~= "stopped" then out("Stopped: " .. stopReason) end
+		return made
+	end
+
+	Commands.spamcars = function(...)
+		local count, followName, mode, testTarget = MAX_CARS, nil, "both", nil
+		for _, a in ipairs({ ... }) do
+			local low = tostring(a):lower()
+			if low == "stop" then
+				if state.busy then
+					state.cancelled = true
+					return out("Stopping...")
+				end
+				return out("Nothing is running")
+			end
+			local n = tonumber(a)
+			if low:match("^test%d*$") then
+				testTarget = tonumber(low:match("%d+")) or TEST_DELETIONS
+			elseif low == "existing" or low == "new" or low == "all" then
+				mode = low
+			elseif n then
+				count = math.clamp(math.floor(n), 1, MAX_CARS)
+			else
+				followName = tostring(a)
+			end
+		end
+		if state.busy then return out("Already running, use 'spamcars stop' to stop it") end
+		local followPlayer
+		if followName then
+			followPlayer = D.findPlayer(followName)
+			if not followPlayer then return out("No player found for '" .. followName .. "'") end
+		end
+		state.busy, state.cancelled = true, false
+		task.spawn(function()
+			local paused = D.pauseAntiSit()
+			local ok, made = pcall(run, count, followPlayer, mode, testTarget)
+			if not ok then out("Error: " .. tostring(made)) made = 0 end
+			D.resumeAntiSit(paused)
+			out("Finished: " .. tostring(made) .. " car" .. (made == 1 and "" or "s") .. " brought")
+			state.busy, state.cancelled = false, false
+		end)
+	end
+end
+
+-- Shared car-fling rig (forcecrim + carbring) ---------------------------------------------
+-- You stand at a car spawner and keep spawning cars; every car you control is slammed into the current target
+-- every frame (Vape FlingExploit method). Getting control of the cars is done in 3 steps, automatically:
+--   1) raise your simulation radius so the server hands you nearby unanchored parts
+--   2) if that isn't enough: sit in each new car for a moment and get out again
+--   3) if control is lost as soon as you get out: stay seated and fling from inside the car
+-- D.startCarRig(opt) -> rig { setTarget(p), hits(), ejects(), riding(), stop() }  or  nil + reason
+--   opt.say = log function, opt.carCap = stop pressing the spawner at this many cars (nil = no cap)
+do
+	local SPAWN_PROTECTION = 2
+	local APPROACH_STEP = 2.4 -- radians the approach side rotates each frame (cycles all sides)
+	local STILL_SPEED = 3
+	local APPROACH_RADII = { 1, 4, 8, 12 }
+	local RAM_SPEED = 10000
+	local RAM_OFFSET = CFrame.new(-2, 0, -1)
+	local CLAIM_FALLBACK_AFTER, NO_CARS_WARNING = 1.5, 6
+	local SIM_RADIUS = 1e9
+	local TRACK_WINDOW, TRACK_BASE_LEAD, TRACK_PING_SCALE, TRACK_MAX_LEAD, TRACK_MAX_SPEED = 0.12, 0.08, 1.5, 0.5, 250
+	local CAR_SPAWN_CFRAME = CFrame.new(-525.802612, 54.7750854, 1774.31689)
+	local BUTTON_RANGE, SPAWN_INTERVAL = 15, 0.1
+	local VOID_Y = math.max(workspace.FallenPartsDestroyHeight + 150, -400)
+	D.VOID_Y = VOID_Y
+	D.CAR_SPAWN_CFRAME = CAR_SPAWN_CFRAME
+
+	local learned = { sitClaim = false, rideOnly = false } -- kept between runs so we don't re-discover it each time
+
+	local function linkPhysics(seat, rootPart)
+		pcall(function()
+			if sethiddenproperty then
+				sethiddenproperty(seat, "PhysicsRepRootPart", rootPart)
+				if InstanceHandle then sethiddenproperty(seat, "PhysicsRepRootRef", InstanceHandle.new(rootPart)) end
+			end
+		end)
+	end
+	local function getPing()
+		local ok, ping = pcall(function() return lplr:GetNetworkPing() end)
+		return (ok and type(ping) == "number") and ping or 0.05
+	end
+	local function boostSimulation()
+		pcall(function() if setsimulationradius then setsimulationradius(SIM_RADIUS, SIM_RADIUS) end end)
+		pcall(function() if sethiddenproperty then sethiddenproperty(lplr, "SimulationRadius", SIM_RADIUS) end end)
+		pcall(function() lplr.MaximumSimulationRadius = SIM_RADIUS end)
+	end
+	D.boostSimulation = boostSimulation
+
+	-- The known-good spawner first, else every "Car Spawner" on the map
+	local function spawnerList()
+		local spawners = D.getSpawners()
+		local items = workspace:FindFirstChild("Prison_ITEMS")
+		local buttons = items and items:FindFirstChild("buttons")
+		local list = buttons and buttons:GetChildren()
+		local known = list and list[7] and list[7]:FindFirstChild("Car Spawner")
+		if known then
+			local idx = table.find(spawners, known)
+			if idx then table.remove(spawners, idx) end
+			table.insert(spawners, 1, known)
+		end
+		return spawners
+	end
+
+	function D.startCarRig(opt)
+		opt = opt or {}
+		local say = opt.say or D.logger("carrig")
+		local carCap = opt.carCap
+		local remote = D.remote("InteractWithItem")
+		local container = workspace:FindFirstChild("CarContainer")
+		local spawners = spawnerList()
+		local button = spawners[1]
+		if not (remote and container and button) then return nil, "Couldn't find the car spawner / remote" end
+		if D.isNeutral(lplr) then return nil, "Pick a team first - you can't spawn cars while on the Neutral team" end
+
+		local missing = {}
+		if not isnetworkowner then table.insert(missing, "isnetworkowner") end
+		if not sethiddenproperty then table.insert(missing, "sethiddenproperty") end
+		if #missing > 0 then say("Warning: your executor is missing " .. table.concat(missing, " + ") .. " - flings probably won't work") end
+
+		local spawnerIndex, buttonPos, standCFrame = 1, nil, nil
+		local function useSpawner(i)
+			spawnerIndex = i
+			button = spawners[i] or button
+			buttonPos = button:IsA("BasePart") and button.Position or button:GetPivot().Position
+			standCFrame = (CAR_SPAWN_CFRAME.Position - buttonPos).Magnitude <= BUTTON_RANGE
+				and CAR_SPAWN_CFRAME or CFrame.new(buttonPos + Vector3.new(0, 3, 0))
+		end
+		useSpawner(1)
+		if #spawners > 1 then say("Using " .. #spawners .. " car spawners") end
+
+		local seats, fresh, touched, attempted, connections = {}, {}, {}, {}, {}
+		local active = true
+		local current, curChar, curSeen = nil, nil, 0
+		local slams, approach = 0, 0
+		local history, histPlayer, histChar = {}, nil, nil
+		local claiming, rideSeat = false, nil
+		local rideOnly, useSitClaim = learned.rideOnly, learned.sitClaim
+		local claimsKept, ejects = 0, 0
+
+		local function owns(seat) return (not isnetworkowner) or isnetworkowner(seat) end
+
+		for _, d in ipairs(container:GetDescendants()) do
+			if d:IsA("VehicleSeat") then seats[d] = true end
+		end
+		table.insert(connections, container.DescendantAdded:Connect(function(inst)
+			if inst:IsA("VehicleSeat") then seats[inst] = true fresh[inst] = true end
+		end))
+		table.insert(connections, container.DescendantRemoving:Connect(function(inst)
+			if inst == rideSeat then rideSeat = nil end
+			seats[inst], fresh[inst], touched[inst], attempted[inst] = nil, nil, nil, nil
+		end))
+
+		-- Every frame: slam the current target with every car we control
+		table.insert(connections, RunService.Heartbeat:Connect(function()
+			local Player = current
+			if not Player then return end
+			local char, h, r = D.getParts(Player)
+			if not (h and r) or h.Health <= 0 then return end
+			if char ~= curChar then curChar, curSeen = char, os.clock() end
+			if os.clock() - curSeen < SPAWN_PROTECTION then return end
+			if h.SeatPart and h.SeatPart.Anchored then return end
+
+			-- Aim where they're about to be (their velocity is zeroed on our side, so measure it from recent positions)
+			local now = os.clock()
+			if Player ~= histPlayer or char ~= histChar then
+				table.clear(history)
+				histPlayer, histChar = Player, char
+			end
+			table.insert(history, { now, r.Position })
+			while #history > 1 and now - history[1][1] > TRACK_WINDOW do table.remove(history, 1) end
+
+			local aim, tgtSpeed = r.Position, 0
+			if #history >= 2 then
+				local oldest = history[1]
+				local dt = now - oldest[1]
+				if dt > 0.02 then
+					local vel = (r.Position - oldest[2]) / dt
+					tgtSpeed = vel.Magnitude
+					if tgtSpeed <= TRACK_MAX_SPEED then
+						vel = Vector3.new(vel.X, math.clamp(vel.Y, -40, 40), vel.Z)
+						aim = r.Position + vel * math.clamp(TRACK_BASE_LEAD + getPing() * TRACK_PING_SCALE, 0, TRACK_MAX_LEAD)
+					end
+				end
+			end
+
+			for seat in pairs(seats) do
+				if seat.Parent and (seat == rideSeat or owns(seat)) then
+					approach += APPROACH_STEP
+					if tgtSpeed < STILL_SPEED and slams % 2 == 0 then
+						-- Standing still: the plain Vape hit (fixed spot beside them) is the one that lands
+						seat.AssemblyLinearVelocity = Vector3.new(RAM_SPEED, RAM_SPEED, 0)
+						seat.CFrame = CFrame.new(aim) * RAM_OFFSET
+					else
+						-- Come in from a different side and distance every frame, driving through them
+						local radius = APPROACH_RADII[(slams % #APPROACH_RADII) + 1]
+						local from = aim + CFrame.Angles(0, approach, 0):VectorToWorldSpace(Vector3.new(0, 0, -radius))
+						local toward = aim - from
+						toward = toward.Magnitude > 0.01 and toward.Unit or Vector3.new(1, 0, 0)
+						seat.AssemblyLinearVelocity = Vector3.new(toward.X * RAM_SPEED, RAM_SPEED, toward.Z * RAM_SPEED)
+						seat.CFrame = CFrame.lookAt(from, aim + Vector3.new(0.001, 0, 0))
+					end
+					r.AssemblyLinearVelocity = Vector3.zero
+					linkPhysics(seat, r)
+					touched[seat] = true
+					slams += 1
+					local car = seat.Parent and seat.Parent.Parent
+					local wheels = car and car:FindFirstChild("Wheels") -- wheels get in the way of the hit
+					if wheels then wheels:Destroy() end
+				end
+			end
+		end))
+
+		-- Safety net: we're only meant to move fast while deliberately riding a slammed car
+		table.insert(connections, RunService.Heartbeat:Connect(function()
+			if not active then return end
+			local myChar = lplr.Character
+			local rt = myChar and myChar:FindFirstChild("HumanoidRootPart")
+			local hum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+			if not (rt and hum) then return end
+			if rideSeat ~= nil or claiming or hum.SeatPart ~= nil then return end
+			if rt.AssemblyLinearVelocity.Magnitude > 400 or rt.Position.Y < VOID_Y + 100 then
+				rt.AssemblyLinearVelocity = Vector3.zero
+				rt.AssemblyAngularVelocity = Vector3.zero
+				myChar:PivotTo(standCFrame)
+			end
+		end))
+
+		-- Out of any seat and back at the spawner, holding speed at zero so nothing inherited from the car carries us off
+		local function leaveCar()
+			local myChar = lplr.Character
+			local hum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+			if hum then
+				local seat = hum.SeatPart
+				if seat then -- leaving a seat that's doing 10000 studs/s throws us into the void
+					pcall(function()
+						seat.AssemblyLinearVelocity = Vector3.zero
+						seat.AssemblyAngularVelocity = Vector3.zero
+					end)
+				end
+				hum.Sit = false
+				pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+				local t = os.clock()
+				while hum.SeatPart and os.clock() - t < 1 do task.wait() end
+			end
+			if myChar then
+				for _ = 1, 6 do
+					pcall(function()
+						myChar:PivotTo(standCFrame)
+						local rt = myChar:FindFirstChild("HumanoidRootPart")
+						if rt then
+							rt.AssemblyLinearVelocity = Vector3.zero
+							rt.AssemblyAngularVelocity = Vector3.zero
+						end
+					end)
+					RunService.Heartbeat:Wait()
+				end
+			end
+		end
+
+		-- Take control of a car by sitting in it
+		local function claimSeat(seat)
+			claiming = true
+			local ok = false
+			if D.sitIn(seat, 2) then
+				if rideOnly then
+					rideSeat, ok = seat, true
+					say("Riding a car to fling from inside it")
+				else
+					local t = os.clock()
+					while isnetworkowner and not isnetworkowner(seat) and os.clock() - t < 0.3 do task.wait() end
+					local ownedSeated = owns(seat)
+					leaveCar()
+					task.wait(0.15)
+					if owns(seat) then
+						claimsKept += 1
+						ok = true
+						if claimsKept == 1 then say("Took control of a car by sitting in it - control stayed after getting out") end
+					else
+						rideOnly = true
+						learned.rideOnly = true
+						attempted[seat] = nil -- try this one again, riding it this time
+						say("Control is lost as soon as you get out of a car (while seated you "
+							.. (ownedSeated and "did" or "did NOT") .. " control it) - flinging from inside the cars instead")
+					end
+				end
+			end
+			if not ok and not rideSeat then leaveCar() end
+			claiming = false
+		end
+
+		-- Claims new cars by sitting in them (only after simulation radius alone failed)
+		task.spawn(function()
+			while active do
+				if rideSeat then -- a slam knocked us out of the seat: sit straight back in, give the car up only if that keeps failing
+					local hum = lplr.Character and lplr.Character:FindFirstChildOfClass("Humanoid")
+					if not hum or hum.SeatPart ~= rideSeat then
+						local seat, back, t = rideSeat, false, os.clock()
+						while active and hum and hum.Health > 0 and seat.Parent and os.clock() - t < 0.6 do
+							pcall(function()
+								lplr.Character:PivotTo(seat.CFrame)
+								seat:Sit(hum)
+							end)
+							task.wait()
+							if hum.SeatPart == seat then back = true break end
+						end
+						if back then ejects += 1 else rideSeat = nil end
+					end
+				end
+				if useSitClaim and not claiming and (not rideOnly or (current ~= nil and rideSeat == nil)) then
+					local pick, pickDist
+					local myRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+					for seat in pairs(seats) do
+						if seat.Parent and fresh[seat] and not attempted[seat] and not seat.Occupant and not owns(seat) then
+							local d = myRoot and (seat.Position - myRoot.Position).Magnitude or 0
+							if not pickDist or d < pickDist then pick, pickDist = seat, d end
+						end
+					end
+					if pick then
+						attempted[pick] = true
+						claimSeat(pick)
+					end
+				end
+				task.wait()
+			end
+		end)
+
+		local function unusedFreshCars()
+			local n = 0
+			for seat in pairs(fresh) do
+				if seat.Parent and not attempted[seat] and not seat.Occupant then n += 1 end
+			end
+			return n
+		end
+		local function carCount() return #container:GetChildren() end
+
+		-- Keep pressing the car spawner while we stand next to it
+		boostSimulation()
+		local lastBoost = os.clock()
+		task.spawn(function()
+			while active do
+				if os.clock() - lastBoost > 1 then
+					lastBoost = os.clock()
+					boostSimulation()
+				end
+				if not claiming and not rideSeat then -- don't move us while we sit in a car to claim / ride it
+					local myRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+					if myRoot then
+						if (myRoot.Position - buttonPos).Magnitude > BUTTON_RANGE then
+							myRoot.CFrame = standCFrame
+							myRoot.AssemblyLinearVelocity = Vector3.zero
+						elseif not (useSitClaim and unusedFreshCars() >= 3) and (not carCap or carCount() < carCap) then
+							local pressed = button
+							task.spawn(function()
+								local ok, res = pcall(function() return remote:InvokeServer(pressed) end)
+								if ok and res == "Wait for the cooldown" and pressed == button and #spawners > 1 then
+									useSpawner(spawnerIndex % #spawners + 1) -- on cooldown: next spawner straight away
+									if not claiming and not rideSeat then
+										local r2 = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+										if r2 then
+											r2.CFrame = standCFrame
+											r2.AssemblyLinearVelocity = Vector3.zero
+										end
+									end
+								end
+							end)
+						end
+					end
+				end
+				task.wait(SPAWN_INTERVAL)
+			end
+		end)
+
+		local function stopCars()
+			for seat in pairs(touched) do
+				if seat.Parent then
+					pcall(function()
+						seat.AssemblyLinearVelocity = Vector3.zero
+						seat.AssemblyAngularVelocity = Vector3.zero
+					end)
+				end
+			end
+		end
+
+		-- Escalate to sitting in cars if simulation radius alone gave nothing, and say what's going on
+		local rigStart, warnedNoCars = os.clock(), false
+		task.spawn(function()
+			while active do
+				if current and slams == 0 then
+					if not useSitClaim and os.clock() - rigStart > CLAIM_FALLBACK_AFTER then
+						useSitClaim = true
+						learned.sitClaim = true
+						say("No car under your control yet - claiming cars by sitting in them")
+					end
+					if not warnedNoCars and os.clock() - rigStart > NO_CARS_WARNING then
+						warnedNoCars = true
+						local total, owned = 0, 0
+						for seat in pairs(seats) do
+							if seat.Parent then
+								total += 1
+								if owns(seat) then owned += 1 end
+							end
+						end
+						say("Warning: no car has hit anyone after " .. NO_CARS_WARNING .. "s (cars seen: " .. total
+							.. ", under your control: " .. owned .. ", isnetworkowner: " .. tostring(isnetworkowner ~= nil)
+							.. ", sethiddenproperty: " .. tostring(sethiddenproperty ~= nil) .. ")")
+					end
+				end
+				task.wait(0.2)
+			end
+		end)
+
+		local rig = {}
+		function rig.setTarget(Player)
+			curChar = Player and Player.Character or nil
+			curSeen = 0 -- the character we start on has been around long enough
+			current = Player
+		end
+		function rig.hits() return slams end
+		function rig.ejects() return ejects end
+		function rig.riding() return rideSeat ~= nil or claiming end
+		function rig.stopCars() stopCars() end
+		function rig.leaveCar() leaveCar() end
+		function rig.stop()
+			active, current = false, nil
+			for _, c in ipairs(connections) do c:Disconnect() end
+			stopCars()
+			local waited = os.clock()
+			while claiming and os.clock() - waited < 3 do task.wait(0.1) end
+			if rideSeat or claiming then
+				rideSeat = nil
+				pcall(leaveCar)
+			end
+		end
+		return rig
+	end
+end
+
+-- forcecrim ----------------------------------------------------------------------------
+-- Flings players with spawned cars until they become Criminals, then stops flinging them.
+--   forcecrim <player> [player2 ...] | forcecrim team [teamname] | forcecrim stop
+do
+	local out = D.logger("forcecrim")
+	local CRIM_TEAM, INMATE_TEAM, ONLY_INMATES = "Criminals", "Inmates", true
+	local TARGET_TIMEOUT, RESPAWN_WAIT = 30, 10
+	local VOID_Y = D.VOID_Y
+
+	local state = _G.DeemForceCrim
+	if type(state) ~= "table" then
+		state = { busy = false, cancelled = false }
+		_G.DeemForceCrim = state
+	end
+	local function isCriminal(p) return p.Team ~= nil and p.Team.Name == CRIM_TEAM end
+
+	local function skipReason(p)
+		local _, hum, root = D.getParts(p)
+		if not (hum and root) or hum.Health <= 0 then return "no character or dead" end
+		if D.isNeutral(p) then return "on the Neutral team" end
+		if isCriminal(p) then return "already a criminal" end
+		if ONLY_INMATES and p.Team.Name ~= INMATE_TEAM then return "on " .. p.Team.Name .. ", not " .. INMATE_TEAM end
+		if hum.SeatPart and hum.SeatPart.Anchored then return "sitting on an anchored chair" end
+	end
+
+	local function runJob(targets)
+		local rig, why = D.startCarRig({ say = out })
+		if not rig then out(why) return 0 end
+		local done = 0
+		local function body()
+			for _, Player in ipairs(targets) do
+				if state.cancelled then break end
+				local reason = skipReason(Player)
+				if reason then
+					out("Skipped " .. Player.Name .. " (" .. reason .. ")")
+				else
+					out("Flinging " .. Player.Name .. " until they become a criminal")
+					rig.setTarget(Player)
+					local start, deadSince, result = os.clock(), nil, nil
+					local hitsStart = rig.hits()
+					local _, _, r0 = D.getParts(Player)
+					local startPos, maxMoved = r0 and r0.Position, 0
+					while result == nil do
+						if state.cancelled then
+							result = "cancelled"
+						elseif not Player.Parent then
+							result = "they left the game"
+						elseif isCriminal(Player) then
+							result = true
+						elseif os.clock() - start > TARGET_TIMEOUT then
+							result = "timed out after " .. TARGET_TIMEOUT .. "s, still on " .. D.teamName(Player)
+						else
+							local myRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+							local _, h, r = D.getParts(Player)
+							if r and startPos then maxMoved = math.max(maxMoved, (r.Position - startPos).Magnitude) end
+							if not myRoot or myRoot.Position.Y < VOID_Y then
+								result = "your character is gone or fell below the map"
+							elseif not (h and r) or h.Health <= 0 then
+								deadSince = deadSince or os.clock()
+								if os.clock() - deadSince > RESPAWN_WAIT then result = "they stayed dead" end
+							else
+								deadSince = nil
+								if h.SeatPart and h.SeatPart.Anchored then result = "they sat on an anchored chair" end
+							end
+						end
+						if result == nil then task.wait(0.1) end
+					end
+					rig.setTarget(nil)
+					rig.stopCars()
+					if rig.riding() then rig.leaveCar() end
+					if result == true then
+						done += 1
+						out(Player.Name .. " is now a criminal")
+					else
+						out("Stopped on " .. Player.Name .. " (" .. tostring(result) .. "; car hits: " .. (rig.hits() - hitsStart)
+							.. ", target moved up to " .. math.floor(maxMoved) .. " studs, knocked out of the car " .. rig.ejects() .. "x)")
+					end
+				end
+			end
+		end
+		local okBody, err = pcall(body)
+		rig.stop()
+		if not okBody then out("Error: " .. tostring(err)) end
+		return done
+	end
+
+	Commands.forcecrim = function(...)
+		local names = { ... }
+		if #names == 0 then return out("Usage: forcecrim <player> [player2 ...]  |  forcecrim team [teamname]  |  forcecrim stop") end
+		if tostring(names[1]):lower() == "stop" then
+			if state.busy then
+				state.cancelled = true
+				return out("Stopping...")
+			end
+			return out("Nothing is running")
+		end
+		if state.busy then return out("Already running, use 'forcecrim stop' to cancel it") end
+
+		local targets, seen = {}, {}
+		local function add(p)
+			if not seen[p] then seen[p] = true table.insert(targets, p) end
+		end
+		if tostring(names[1]):lower() == "team" then
+			local teamNames = {}
+			for i = 2, #names do table.insert(teamNames, names[i]) end
+			if #teamNames == 0 then teamNames = { INMATE_TEAM } end
+			for _, tn in ipairs(teamNames) do
+				local team = D.findTeam(tostring(tn))
+				if not team then
+					out("No team found for '" .. tostring(tn) .. "'")
+				else
+					local count = 0
+					for _, p in ipairs(Players:GetPlayers()) do
+						if p ~= lplr and p.Team == team then add(p) count += 1 end
+					end
+					if count == 0 then out("No players on team " .. team.Name) end
+				end
+			end
+		else
+			for _, n in ipairs(names) do
+				local matches = D.findPlayers(tostring(n))
+				if #matches == 0 then out("No player found for '" .. tostring(n) .. "'") end
+				for _, p in ipairs(matches) do add(p) end
+			end
+		end
+		if #targets == 0 then return end
+
+		local myChar = lplr.Character
+		local home = myChar and myChar:FindFirstChild("HumanoidRootPart") and myChar:GetPivot()
+		state.busy, state.cancelled = true, false
+		D.setBusy("forcecrim", true)
+		task.spawn(function()
+			local paused = D.pauseAntiSit()
+			local ok, done = pcall(runJob, targets)
+			if not ok then out("Error: " .. tostring(done)) done = 0 end
+			local c = lplr.Character
+			if home and c and c:FindFirstChild("HumanoidRootPart") then pcall(function() c:PivotTo(home) end) end
+			D.resumeAntiSit(paused)
+			out("Finished: " .. tostring(done) .. "/" .. #targets .. " turned criminal")
+			state.busy, state.cancelled = false, false
+			D.setBusy("forcecrim", false)
+		end)
+	end
+	D.forcecrimRunning = function() return state.busy end
+end
+
+-- carbring -----------------------------------------------------------------------------
+-- carbring <player> [player2 ...] | carbring team <team> [team2 ...] | carbring stop
+-- Brings players to where you stand in a car (3 per trip). Players already sitting in a car are flung instead
+-- with the shared car rig (same method as forcecrim).
+do
+	local out = D.logger("carbring")
+	local VOID_Y = D.VOID_Y
+	local MAX_TARGET_SPEED, MAX_STEP = 80, 120
+	local FLING_TIME, FLING_DONE_SPEED, FLING_JUMP = 20, 10000, 100
+	local CAR_CAP, RESCUE_SPEED = 30, 600
+	local SIT_TIMEOUT, PASSENGERS_PER_TRIP = 15, 3
+
+	local state = _G.DeemCarBring
+	if type(state) ~= "table" then
+		state = { busy = false, cancelled = false }
+		_G.DeemCarBring = state
+	end
+	local cancelled = function() return state.cancelled end
+
+	-- Watchdog: while carbring runs, catch us falling toward the void / being thrown and put us back at the last safe spot
+	local watch = { conn = nil, lastSafe = nil, ridingFn = nil, rescues = 0 }
+	local function startWatchdog()
+		if watch.conn then return end
+		watch.rescues = 0
+		watch.conn = RunService.Heartbeat:Connect(function()
+			local char = lplr.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if not (root and hum) then return end
+			local riding = watch.ridingFn and watch.ridingFn() or false
+			local speed = root.AssemblyLinearVelocity.Magnitude
+			local inVoid = root.Position.Y < VOID_Y + 100
+			local thrown = speed > RESCUE_SPEED and not riding
+			if inVoid or thrown then
+				if watch.lastSafe then
+					watch.rescues += 1
+					if watch.rescues == 1 or watch.rescues % 50 == 0 then
+						out("Caught you " .. (inVoid and "heading into the void" or "being thrown") .. " - putting you back")
+					end
+					hum.Sit = false
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					char:PivotTo(watch.lastSafe)
+				end
+			elseif speed < 150 then
+				watch.lastSafe = root.CFrame
+			end
+		end)
+	end
+	local function stopWatchdog()
+		if watch.conn then watch.conn:Disconnect() watch.conn = nil end
+		watch.lastSafe, watch.ridingFn = nil, nil
+	end
+
+	-- Moves the car onto the target every frame until they sit in any free passenger seat
+	local function CarFollow(Car, Player, seats)
+		local start = os.clock()
+		local lastTick, lastTargetPos = start, nil
+		local driverSeat = Car:FindFirstChild("Body") and Car.Body:FindFirstChild("VehicleSeat")
+		while os.clock() - start < SIT_TIMEOUT do
+			if state.cancelled then return false, "stopped" end
+			local nowT = os.clock()
+			local frameDt = nowT - lastTick
+			lastTick = nowT
+			local _, hum, root = D.getParts(Player)
+			if not (hum and root) or hum.Health <= 0 then return false, "target died or left" end
+			if not Player.Parent then return false, "target left the game" end
+			for _, s in ipairs(seats) do
+				if hum.SeatPart == s then return true end
+			end
+			if hum.SeatPart and hum.SeatPart.Anchored then return false, "target sat on an anchored seat" end
+
+			if D.ffGate(root.Position, out) then -- hold until the forcefield is gone (doesn't count against the timeout)
+				start += frameDt
+				task.wait()
+				continue
+			end
+
+			local aimSeat
+			for _, s in ipairs(seats) do
+				if not s.Occupant then aimSeat = s break end
+			end
+			if not aimSeat then return false, "no free seats left" end
+			Car.PrimaryPart = aimSeat
+
+			if root.Position.Y < VOID_Y + 100 then return false, "target is in the void" end
+			local myRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+			if not myRoot or myRoot.Position.Y < VOID_Y then return false, "you fell below the map" end
+
+			-- A target that is flinging / moving too fast or just jumped a huge distance: hold still instead of chasing
+			local jumped = lastTargetPos and (root.Position - lastTargetPos).Magnitude > MAX_STEP
+			lastTargetPos = root.Position
+			if jumped or root.AssemblyLinearVelocity.Magnitude > MAX_TARGET_SPEED then
+				aimSeat.AssemblyLinearVelocity = Vector3.zero
+				aimSeat.AssemblyAngularVelocity = Vector3.zero
+				task.wait()
+				continue
+			end
+
+			Car:PivotTo(root.CFrame * CFrame.new(0, -1, 0))
+			aimSeat.AssemblyLinearVelocity = Vector3.zero
+			aimSeat.AssemblyAngularVelocity = Vector3.zero
+			if driverSeat then
+				driverSeat.AssemblyLinearVelocity = Vector3.zero -- the seat WE sit in must not build up speed either
+				driverSeat.AssemblyAngularVelocity = Vector3.zero
+			end
+			task.wait()
+		end
+		return false, "timed out waiting for target to sit"
+	end
+
+	local function isInCar(hum)
+		local seat = hum.SeatPart
+		if not seat then return false end
+		if seat:IsA("VehicleSeat") then return true end
+		local container = workspace:FindFirstChild("CarContainer")
+		return container ~= nil and seat:IsDescendantOf(container)
+	end
+
+	-- Fallback fling (no cars available): spin our character inside them. Always puts us back at OrigPiv.
+	local function Fling(Player, OrigPiv)
+		local myChar, myHum, myRoot = D.getMe()
+		if not myRoot then return false end
+		local spin = Instance.new("BodyAngularVelocity")
+		spin.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+		spin.P = math.huge
+		spin.AngularVelocity = Vector3.new(0, 9e5, 0)
+		spin.Parent = myRoot
+		myHum.PlatformStand = true
+		local flung, start, step = false, os.clock(), 0
+		while os.clock() - start < FLING_TIME and not state.cancelled do
+			local _, hum, root = D.getParts(Player)
+			if not (hum and root) or hum.Health <= 0 then break end
+			if myRoot.Position.Y < VOID_Y then break end
+			local target = hum.SeatPart or root
+			step += 1
+			myRoot.CFrame = target.CFrame * CFrame.new(0, (step % 2 == 0) and 1.5 or -1.5, 0) -- jitter so the spin keeps connecting
+			myRoot.AssemblyLinearVelocity = Vector3.zero
+			if target.AssemblyLinearVelocity.Magnitude > FLING_DONE_SPEED or root.AssemblyLinearVelocity.Magnitude > FLING_DONE_SPEED then
+				flung = true
+				break
+			end
+			RunService.Heartbeat:Wait()
+		end
+		spin:Destroy()
+		myHum.PlatformStand = false
+		for _ = 1, 3 do
+			myRoot.AssemblyLinearVelocity = Vector3.zero
+			myRoot.AssemblyAngularVelocity = Vector3.zero
+			myChar:PivotTo(OrigPiv)
+			task.wait(0.05)
+		end
+		return flung
+	end
+
+	-- Flings a target who is in a car with the shared rig. Returns flung, reason, hits, studsMoved (or nil + reason).
+	local function CarFling(Player, OrigPiv)
+		local rig, rigErr = D.startCarRig({ say = out, carCap = CAR_CAP })
+		if not rig then return nil, rigErr end
+		watch.ridingFn = rig.riding -- don't "rescue" us from our own ride
+
+		local _, _, startRoot = D.getParts(Player)
+		local startPos = startRoot and startRoot.Position
+		local lastPos, maxMoved = startPos, 0
+		rig.setTarget(Player)
+
+		local flung, reason, start = false, "timed out after " .. FLING_TIME .. "s", os.clock()
+		while os.clock() - start < FLING_TIME do
+			if state.cancelled then reason = "stopped" break end
+			local _, hum, root = D.getParts(Player)
+			if not (hum and root) or hum.Health <= 0 then reason = "target died or left" break end
+			if not Player.Parent then reason = "target left the game" break end
+			local myRoot = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
+			if not myRoot or myRoot.Position.Y < VOID_Y then reason = "you fell below the map" break end
+
+			-- A hit landed = a big position jump between frames, or a huge speed (their velocity is zeroed on our side)
+			local target = hum.SeatPart or root
+			if startPos then maxMoved = math.max(maxMoved, (root.Position - startPos).Magnitude) end
+			local jumped = lastPos and (root.Position - lastPos).Magnitude > FLING_JUMP
+			lastPos = root.Position
+			if jumped or target.AssemblyLinearVelocity.Magnitude > FLING_DONE_SPEED or root.AssemblyLinearVelocity.Magnitude > FLING_DONE_SPEED then
+				flung, reason = true, nil
+				break
+			end
+			RunService.Heartbeat:Wait()
+		end
+
+		local hits = rig.hits()
+		rig.stop()
+		watch.ridingFn = nil
+		local myChar = lplr.Character
+		if myChar then
+			for _ = 1, 6 do -- back where we started, speed held at zero so nothing inherited from a car carries us off
+				pcall(function()
+					myChar:PivotTo(OrigPiv)
+					local rt = myChar:FindFirstChild("HumanoidRootPart")
+					if rt then
+						rt.AssemblyLinearVelocity = Vector3.zero
+						rt.AssemblyAngularVelocity = Vector3.zero
+					end
+				end)
+				RunService.Heartbeat:Wait()
+			end
+		end
+		return flung, reason, hits, math.floor(maxMoved)
+	end
+
+	-- Spawns a car and seats us in the driver seat. Returns { Car, Driver, Seats } or nil + a reason.
+	local function getDriverCar(OrigPiv)
+		local myChar = D.getMe()
+		if not myChar then return nil, "Your character isn't ready" end
+		local Car, why = D.spawnCar(out, cancelled)
+		if not Car then
+			myChar:PivotTo(OrigPiv)
+			return nil, why or "Car didn't spawn (timed out)"
+		end
+		local body = Car:WaitForChild("Body", 5)
+		local driverSeat = body and body:WaitForChild("VehicleSeat", 5)
+		local passengerSeat = body and body:WaitForChild("Seat", 5)
+		if not (driverSeat and passengerSeat) then
+			myChar:PivotTo(OrigPiv)
+			return nil, "Car is missing its seats"
+		end
+		task.wait(0.1) -- let the rest of the car finish replicating
+		local seats = {}
+		for _, d in ipairs(Car:GetDescendants()) do
+			if d:IsA("Seat") then table.insert(seats, d) end
+		end
+		if not table.find(seats, passengerSeat) then table.insert(seats, 1, passengerSeat) end
+		-- Sit in the driver seat so we own the car's physics
+		if not D.sitIn(driverSeat, 5) then
+			(lplr.Character or myChar):PivotTo(OrigPiv)
+			return nil, "Couldn't sit in the car"
+		end
+		return { Car = Car, Driver = driverSeat, Seats = seats }
+	end
+
+	-- Skip checks (and in-car flinging) for one target. Returns true if they should be picked up by the car.
+	local function prepareTarget(Player)
+		local _, hum, root = D.getParts(Player)
+		if not (hum and root) or hum.Health <= 0 then
+			out("Skipped " .. Player.Name .. " (no character or dead)")
+			return false
+		end
+		D.waitForForcefield(function()
+			local _, _, r = D.getParts(Player)
+			return r and r.Position
+		end, cancelled, out)
+		if D.isNeutral(Player) then
+			out("Skipped " .. Player.Name .. " (on the Neutral team)")
+			return false
+		end
+		if hum.SeatPart and hum.SeatPart.Anchored then
+			out("Skipped " .. Player.Name .. " (sitting on an anchored chair)")
+			return false
+		end
+		if isInCar(hum) then -- in a car: fling them instead of bringing them
+			local flingChar = lplr.Character
+			if not (flingChar and flingChar:FindFirstChild("HumanoidRootPart")) then
+				out("Your character isn't ready")
+				return false
+			end
+			out(Player.Name .. " is in a car, ramming them with cars")
+			local origin = flingChar:GetPivot()
+			local flung, reason, hits, moved = CarFling(Player, origin)
+			if flung == nil then
+				out(tostring(reason) .. " - falling back to character fling")
+				flung = Fling(Player, origin)
+				reason, hits, moved = nil, nil, nil
+			end
+			if flung then
+				out("Flung " .. Player.Name)
+			else
+				out("Fling on " .. Player.Name .. " didn't land (" .. tostring(reason or "timed out")
+					.. (hits and ("; car hits: " .. hits .. ", target moved up to " .. moved .. " studs") or "") .. ")")
+			end
+			return false
+		end
+		return true
+	end
+
+	-- Brings up to PASSENGERS_PER_TRIP players in ONE car trip. Returns the players that didn't fit.
+	local function CarBringGroup(group)
+		local leftover = {}
+		local myChar, myHum, myRoot = D.getMe()
+		if not myRoot then
+			out("Your character isn't ready")
+			return leftover
+		end
+		local OrigPiv = myChar:GetPivot()
+		local rig, rigErr = getDriverCar(OrigPiv)
+		if not rig then
+			out(rigErr)
+			return leftover
+		end
+		local Car, driverSeat, seats = rig.Car, rig.Driver, rig.Seats
+		local capacity = math.min(#seats, PASSENGERS_PER_TRIP)
+		local brought = {}
+		for _, Player in ipairs(group) do
+			if #brought >= capacity or state.cancelled then
+				table.insert(leftover, Player)
+			else
+				local ok, reason = CarFollow(Car, Player, seats) -- earlier passengers stay seated while we fetch the next
+				if ok then table.insert(brought, Player.Name) else out("Failed on " .. Player.Name .. " (" .. tostring(reason) .. ")") end
+			end
+		end
+		if state.cancelled then leftover = {} end
+		if #brought > 0 then
+			D.waitForForcefield(function() return OrigPiv.Position end, cancelled, out)
+			Car.PrimaryPart = driverSeat
+			Car:PivotTo(OrigPiv)
+			for _, d in ipairs(Car:GetDescendants()) do
+				if d:IsA("BasePart") then
+					d.AssemblyLinearVelocity = Vector3.zero
+					d.AssemblyAngularVelocity = Vector3.zero
+				end
+			end
+			task.wait(0.1)
+			out("Brought " .. table.concat(brought, ", "))
+		end
+		myHum.Sit = false
+		task.wait(0.1)
+		for _ = 1, 4 do
+			myChar:PivotTo(OrigPiv)
+			myRoot.AssemblyLinearVelocity = Vector3.zero
+			myRoot.AssemblyAngularVelocity = Vector3.zero
+			RunService.Heartbeat:Wait()
+		end
+		return leftover
+	end
+
+	Commands.carbring = function(...)
+		local names = { ... }
+		if #names == 0 then return out("Usage: carbring <player> [player2 ...]  |  carbring team <teamname>  |  carbring stop") end
+		if tostring(names[1]):lower() == "stop" then
+			if state.busy then
+				state.cancelled = true
+				return out("Stopping...")
+			end
+			return out("Nothing is running")
+		end
+		if state.busy then return out("Already running a car bring, use 'carbring stop' or wait for it to finish") end
+
+		local targets, seen = {}, {}
+		local function add(p)
+			if not seen[p] then seen[p] = true table.insert(targets, p) end
+		end
+		if tostring(names[1]):lower() == "team" then
+			if not names[2] then return out("Usage: carbring team <teamname>") end
+			for i = 2, #names do
+				local team = D.findTeam(tostring(names[i]))
+				if not team then
+					out("No team found for '" .. tostring(names[i]) .. "'")
+				else
+					local count = 0
+					for _, p in ipairs(Players:GetPlayers()) do
+						if p ~= lplr and p.Team == team then add(p) count += 1 end
+					end
+					if count == 0 then out("No players on team " .. team.Name) end
+				end
+			end
+		else
+			for _, n in ipairs(names) do
+				local matches = D.findPlayers(tostring(n))
+				if #matches == 0 then out("No player found for '" .. tostring(n) .. "'") end
+				for _, p in ipairs(matches) do add(p) end
+			end
+		end
+		if #targets == 0 then return end
+		if #targets > PASSENGERS_PER_TRIP then out("Bringing " .. #targets .. " players, " .. PASSENGERS_PER_TRIP .. " per trip") end
+
+		state.busy, state.cancelled = true, false
+		D.setBusy("carbring", true)
+		task.spawn(function()
+			local paused = D.pauseAntiSit()
+			startWatchdog()
+			local pending = targets
+			while #pending > 0 and not state.cancelled do
+				local group = {}
+				while #pending > 0 and #group < PASSENGERS_PER_TRIP and not state.cancelled do
+					local p = table.remove(pending, 1)
+					local okPrep, usable = pcall(prepareTarget, p)
+					if not okPrep then out("Error on " .. p.Name .. ": " .. tostring(usable))
+					elseif usable then table.insert(group, p) end
+				end
+				if #group > 0 and not state.cancelled then
+					local okGroup, leftover = pcall(CarBringGroup, group)
+					if okGroup then
+						for i = #leftover, 1, -1 do table.insert(pending, 1, leftover[i]) end -- didn't fit: front of the queue
+					else
+						out("Error during trip: " .. tostring(leftover))
+					end
+				end
+			end
+			stopWatchdog()
+			D.resumeAntiSit(paused)
+			if state.cancelled then out("Stopped") end
+			state.busy, state.cancelled = false, false
+			D.setBusy("carbring", false)
+		end)
+	end
+	D.carbringRunning = function() return state.busy end
+end
+
+-- stand --------------------------------------------------------------------------------
+-- JoJo-style stand: hover beside a player, copy their animations, and react to what they say in chat
+-- (ora / punch / za warudo / star finger / any command listed in Stand_commands). See 'stand help' in game.
+do
+local TextChatService = game:GetService("TextChatService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local OFFSET = CFrame.new(-3, 2.5, 1.5) -- relative to the player: left, up, a little behind
+local SKIP_ANIM = "507768375"             -- same animation the copyanimation command skips
+
+local function busyFlag(name)
+	return function() return type(_G.DeemBusy) == "table" and _G.DeemBusy[name] == true end
+end
+-- Commands the stand user may run by saying them in chat (first word). "running" is true while that command is active,
+-- "stop" is the command line that cancels it ("return" / "recall"). They run straight through the built-in Commands table.
+local function poseRunning(kind) return function() return D.poseRunning(kind) end end
+local Stand_commands = {
+	hug       = { running = poseRunning("hug"),  stop = "hug stop" },
+	closehug  = { running = poseRunning("hug"),  stop = "closehug stop" }, -- shares hug's pose engine
+	kiss      = { running = poseRunning("kiss"), stop = "kiss stop" },
+	ufo       = { running = function() return D.ufoRunning() end, stop = "ufo stop" },
+	carbring  = { running = busyFlag("carbring"),  stop = "carbring stop" },
+	forcecrim = { running = busyFlag("forcecrim"), stop = "forcecrim stop" },
+	tpbomb    = { running = busyFlag("tpbomb"),    stop = "tpbomb stop" },
+}
+-- Extra nicknames only the stand knows (your own "alias" nicknames work too, read live from _G.DeemAliases)
+local Stand_aliases = {
+	-- bomb = "tpbomb",
+}
+local FF_APPEAR_GRACE = 2  -- seconds after you respawn to wait for your team + forcefield to be applied
+local FF_STABLE = 0.4      -- the forcefield must stay gone this long before the stand starts following
+
+-- Moves ---------------------------------------------------------------------------
+local PUNCH_KEY = Enum.KeyCode.F    -- your game's punch keybind
+-- If the stand user plays any of these animations (their punch animations), the stand punches too, like "punch"
+local PUNCH_ANIMS = { "484926359", "484200742" }
+local PUNCH_INTERVAL = 0.1          -- seconds between punches during a barrage
+local GLIDE_SPEED = 18               -- how fast the stand glides into / out of a move (higher = faster, lower = slower)
+local GLIDE_MAX = 0.6               -- a glide never lasts longer than this many seconds
+local PUNCH_KEYCODE = 0x46          -- same key as PUNCH_KEY, for executors that have keypress() (0x46 = F)
+local FRONT_DISTANCE = 6            -- studs in front of the stand user
+local BARRAGE_PER_WORD = 0.6        -- seconds of barrage per "ora" said
+local BARRAGE_MIN, BARRAGE_MAX = 1.5, 10
+
+-- Each move: Lua patterns that trigger it (matched against the lowercase chat line) and what it does.
+-- "barrage" = spam punches for a while, "punch" = one punch, "cancel" = end the current move.
+local MOVES = {
+	{ kind = "barrage", patterns = { "%f[%a]ora+%f[%A]", "%f[%a]mu+d+a+%f[%A]" } },
+	{ kind = "punch",   patterns = { "%f[%a]punch%f[%A]" } },
+	{ kind = "cancel",  patterns = { "%f[%a]return%f[%A]", "%f[%a]recall%f[%A]", "stand back" } },
+}
+
+local out = D.logger("stand")
+
+-- State lives in _G so "stand stop" still works when the loader runs this file again
+local state = _G.DeemStand
+if type(state) ~= "table" then
+	state = {}
+	_G.DeemStand = state
+end
+
+-- Star Finger puts the silentgun grip on the Remington; this undoes it and unequips the gun
+local SILENT_GRIP = Vector3.new(3000, 3000, 3000) -- same GripPos the silentgun command uses
+local function sfCleanup()
+	local sf = state.sf
+	if not sf then return end
+	state.sf = nil
+	if sf.tool and sf.tool.Parent then
+		pcall(function() sf.tool.GripPos = sf.origGrip end)
+	end
+	local char = lplr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then pcall(function() hum:UnequipTools() end) end
+end
+
+local function stopStand()
+	sfCleanup()
+	state.cmd = nil
+	if state.conn then
+		state.conn:Disconnect()
+		state.conn = nil
+	end
+	if state.chatConns then
+		for _, c in ipairs(state.chatConns) do pcall(function() c:Disconnect() end) end
+		state.chatConns = nil
+	end
+	state.move = nil
+	if state.atk then
+		for _, t in ipairs(state.atk.tracks) do pcall(function() t:Stop(0) t:Destroy() end) end
+		state.atk = nil
+	end
+	state.inMove, state.exitUntil = false, nil
+	if state.mirrors then
+		for _, m in pairs(state.mirrors) do
+			pcall(function() m:Stop() m:Destroy() end)
+		end
+	end
+	state.mirrors, state.target, state.waiting = nil, nil, false
+end
+
+local findPlayer = D.findPlayer
+
+local inPrison = D.inPrison
+-- While we're a Criminal with a forcefield on (just respawned), don't teleport into the prison
+local function shouldWait(char, tRoot) return D.ffBlocks(tRoot.Position) end
+
+-- Presses the punch key every way we can, because which one the game accepts depends on the executor
+local function pressPunch()
+	pcall(function() VirtualInputManager:SendKeyEvent(true, PUNCH_KEY, false, game) end)
+	if keypress then pcall(keypress, PUNCH_KEYCODE) end
+	-- a tool in your hands (e.g. Fists) can also be swung directly
+	local char = lplr.Character
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	if tool then pcall(function() tool:Activate() end) end
+	task.delay(0.03, function()
+		pcall(function() VirtualInputManager:SendKeyEvent(false, PUNCH_KEY, false, game) end)
+		if keyrelease then pcall(keyrelease, PUNCH_KEYCODE) end
+	end)
+end
+
+-- Smoothly moves the root toward a CFrame (frame-rate independent). Returns true once it has arrived.
+local function glideTo(root, goal, dt)
+	local alpha = 1 - math.exp(-GLIDE_SPEED * dt)
+	root.CFrame = root.CFrame:Lerp(goal, alpha)
+	return (root.Position - goal.Position).Magnitude < 0.4
+end
+
+-- Kill aura: aim at the first player standing in front of the stand user -----------------------
+local ATTACK_ANIMS = { "484926359", "484200742" } -- punch animations played on every hit
+local SCAN_RANGE = 80                            -- how far in front of the stand user to look
+local SCAN_ANGLES = { 0, 4, -4, 8, -8, 15, -15, 25, -25 } -- degrees; a fan of rays, centre first
+local ATTACK_DISTANCE = 3                        -- studs between you and the victim while hitting
+local RESCAN_INTERVAL = 0.25                     -- seconds between looking for a new victim
+
+-- ZA WARUDO: the stand user says "za warudo <player>" and you orbit that player at top speed, hitting them
+-- with the kill aura until they die
+local ZW_PATTERN = "za%s*w[ao]r[ul]?do"  -- matches "za warudo", "zawarudo", "za worldo"
+local ZW_RADIUS = 4                      -- studs from the target while circling
+local ZW_SPEED = 45                      -- orbit speed in radians per second (higher = faster)
+local ZW_HIT_INTERVAL = 0.05             -- seconds between hits while circling
+local ZW_MAX = 120                       -- safety: give up after this many seconds even if they never die
+
+-- STAR FINGER: the stand user says "star finger <player>". Same team as you = kill aura. Different team = you
+-- equip a Remington (fetching one if you have none), put the silentgun grip on it and shoot them with ShootEvent
+local SF_PATTERN = "star%s*finger"
+local SF_GUN_NAME = "Remington 870"
+local SF_GUN_SPOT = Vector3.new(821, 98, 2219)  -- where you teleport to pick up a Remington
+local SF_DISTANCE = 12                          -- studs from the target while shooting
+local SF_SHOT_INTERVAL = 0.4                    -- seconds between shots
+local SF_MAX = 120                              -- safety: give up after this many seconds
+-- Star Finger decides HOW to attack from your team and the target's player attributes "Hostile" / "Trespassing":
+--   You're a Criminal (or anything that isn't a Guard):  target Hostile or Trespassing = shoot them (gun method),
+--                                                         anyone else (innocent) = kill aura. A team mate = kill aura.
+--   You're a Guard:  target is a Criminal or Hostile = shoot them. Trespassing = arrest them (ArrestPlayer remote,
+--                    same as arrestall). Anything else = say "Target is not killable/arrestable at the moment".
+-- It re-checks every 0.25s, so if their attributes change mid-move the stand switches method.
+local SF_RECHECK = 0.25
+local SF_DENY_MESSAGE = "Target is not killable/arrestable at the moment"
+local ARREST_OFFSET = Vector3.new(3, 1, 0)   -- where the stand sits next to the target while arresting (like arrestall)
+local ARREST_COOLDOWN = 7                    -- seconds the game makes you wait after a successful arrest
+local ARREST_INTERVAL = 0.1                  -- seconds between arrest attempts
+local ARREST_MAX_TRIES = 25                  -- attempts before giving up
+local SF_SPOT_NAMES = { "back to the stand user's side", "moving behind the target", "moving to the target's left", "moving to the target's right" }
+
+local function playerFromPart(part)
+	local model = part:FindFirstAncestorOfClass("Model")
+	while model do
+		local p = Players:GetPlayerFromCharacter(model)
+		if p then return p end
+		model = model.Parent and model.Parent:FindFirstAncestorOfClass("Model")
+	end
+end
+
+local function validVictim(p, target)
+	if not p or p == lplr or p == target then return false end
+	local c = p.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	return c ~= nil and c:FindFirstChild("HumanoidRootPart") ~= nil and h ~= nil and h.Health > 0
+end
+
+-- Finds a player by the start of their name / display name (not you, not the stand user)
+local function findPlayerByName(name, target)
+	name = name:lower()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= lplr and p ~= target
+			and (p.Name:lower():sub(1, #name) == name or p.DisplayName:lower():sub(1, #name) == name) then
+			return p
+		end
+	end
+end
+
+-- Star Finger helpers ---------------------------------------------------------------------
+-- "Hostile" / "Trespassing" are read from the player, and from their character too in case the game puts them there
+local function flag(p, name)
+	if p:GetAttribute(name) == true then return true end
+	local c = p.Character
+	return c ~= nil and c:GetAttribute(name) == true
+end
+local function teamName(p) return p.Team and p.Team.Name or "" end
+local function isGuard(p) return teamName(p):lower():find("guard", 1, true) ~= nil end
+
+-- Returns "gun" | "melee" | "arrest" | "deny", plus a short reason for the log
+local function sfDecide(v)
+	local hostile, trespassing = flag(v, "Hostile"), flag(v, "Trespassing")
+	if isGuard(lplr) then
+		if teamName(v) == "Criminals" then return "gun", "a Criminal" end
+		if hostile then return "gun", "Hostile" end
+		if trespassing then return "arrest", "Trespassing" end
+		return "deny", "not a Criminal, Hostile or Trespassing"
+	end
+	-- Hostile / Trespassing decide it first, whatever team they're on (a team mate who is Hostile still gets shot)
+	if isGuard(v) then return "gun", "a Guard" end -- Criminals / Inmates shoot Guards
+	if hostile then return "gun", "Hostile" end
+	if trespassing then return "gun", "Trespassing" end
+	if lplr.Team ~= nil and lplr.Team == v.Team then return "melee", "on your team and not Hostile/Trespassing" end
+	return "melee", "not Hostile or Trespassing"
+end
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local function getRemington()
+	local char = lplr.Character
+	return (char and char:FindFirstChild(SF_GUN_NAME)) or lplr.Backpack:FindFirstChild(SF_GUN_NAME)
+end
+
+-- Teleports to the gun spot, picks up the Remington, then waits (up to 3s) for it to show up
+local function fetchRemington(move)
+	move.fetching = true
+	task.spawn(function()
+		local char = lplr.Character
+		local r = char and char:FindFirstChild("HumanoidRootPart")
+		if r then r.CFrame = CFrame.new(SF_GUN_SPOT) end
+		task.wait(0.3)
+		pcall(function()
+			local item = workspace.Prison_ITEMS.giver[SF_GUN_NAME]:GetChildren()[3]
+			ReplicatedStorage.Remotes.InteractWithItem:InvokeServer(item)
+		end)
+		local t = os.clock()
+		while not getRemington() and os.clock() - t < 3 do task.wait(0.1) end
+		move.fetching = false
+		move.fetched = true
+	end)
+end
+
+-- True if nothing but the victim is between a point and their head (other players don't count as walls)
+local function clearShot(fromPos, vChar, char)
+	local head = vChar:FindFirstChild("Head") or vChar:FindFirstChild("HumanoidRootPart")
+	if not head then return false end
+	local ignore = { char }
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Character and p.Character ~= vChar then table.insert(ignore, p.Character) end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+	local res = workspace:Raycast(fromPos, head.Position - fromPos, params)
+	return res == nil or res.Instance:IsDescendantOf(vChar)
+end
+
+-- The places you can shoot from, in order of preference: 1 the stand user's side, 2 behind the target, 3 their left, 4 their right
+local function sfSpots(vRoot, tRoot)
+	local cf = vRoot.CFrame
+	local dir = vRoot.Position - tRoot.Position
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.1 then
+		local look = tRoot.CFrame.LookVector
+		dir = Vector3.new(look.X, 0, look.Z)
+	end
+	dir = dir.Unit
+	local y = vRoot.Position.Y
+	local base = {
+		vRoot.Position - dir * SF_DISTANCE,
+		(cf * CFrame.new(0, 0, SF_DISTANCE)).Position,
+		(cf * CFrame.new(-SF_DISTANCE, 0, 0)).Position,
+		(cf * CFrame.new(SF_DISTANCE, 0, 0)).Position,
+	}
+	local spots = {}
+	for i, p in ipairs(base) do
+		local pos = Vector3.new(p.X, y, p.Z)
+		spots[i] = CFrame.lookAt(pos, Vector3.new(vRoot.Position.X, y, vRoot.Position.Z))
+	end
+	return spots
+end
+
+-- Raycasts forward from the stand user; the first player hit (walls block the ray) is the victim
+local function findVictim(char, tChar, tRoot, target)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char, tChar }
+	for _, deg in ipairs(SCAN_ANGLES) do
+		local dir = (tRoot.CFrame * CFrame.Angles(0, math.rad(deg), 0)).LookVector
+		local hit = workspace:Raycast(tRoot.Position, dir * SCAN_RANGE, params)
+		if hit then
+			local p = playerFromPart(hit.Instance)
+			if validVictim(p, target) then return p end
+		end
+	end
+	-- Rays missed (thin rays can slip past a moving player): fall back to the closest player in a wide cone in front
+	local look = tRoot.CFrame.LookVector
+	local best, bestDist
+	for _, p in ipairs(Players:GetPlayers()) do
+		if validVictim(p, target) then
+			local off = p.Character.HumanoidRootPart.Position - tRoot.Position
+			local dist = off.Magnitude
+			if dist <= SCAN_RANGE and dist > 0.1 and off.Unit:Dot(look) > 0.7 and (not bestDist or dist < bestDist) then
+				best, bestDist = p, dist
+			end
+		end
+	end
+	return best
+end
+
+-- Where you stand while hitting: ATTACK_DISTANCE from the victim, on the stand user's side, facing them
+local function victimPosition(vRoot, tRoot)
+	local dir = vRoot.Position - tRoot.Position
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.1 then
+		local look = tRoot.CFrame.LookVector
+		dir = Vector3.new(look.X, 0, look.Z)
+	end
+	dir = dir.Unit
+	local pos = vRoot.Position - dir * ATTACK_DISTANCE
+	return CFrame.lookAt(pos, Vector3.new(vRoot.Position.X, pos.Y, vRoot.Position.Z))
+end
+
+local meleeEvent
+local function getMelee()
+	if meleeEvent and meleeEvent.Parent then return meleeEvent end
+	meleeEvent = game:GetService("ReplicatedStorage"):FindFirstChild("meleeEvent")
+	return meleeEvent
+end
+
+-- One hit on the victim, with a punch animation
+local function hit(victim, hum)
+	local ev = getMelee()
+	if ev then
+		pcall(function() ev:FireServer(victim, 1, 1) end)
+	end
+	local atk = state.atk
+	if not atk or atk.hum ~= hum then
+		atk = { hum = hum, tracks = {}, i = 0 }
+		for _, id in ipairs(ATTACK_ANIMS) do
+			local a = Instance.new("Animation")
+			a.AnimationId = "rbxassetid://" .. id
+			local ok, t = pcall(function() return hum:LoadAnimation(a) end)
+			if ok and t then
+				t.Priority = Enum.AnimationPriority.Action
+				table.insert(atk.tracks, t)
+			end
+		end
+		state.atk = atk
+	end
+	if #atk.tracks > 0 then
+		atk.i = atk.i % #atk.tracks + 1 -- alternate between the two punch animations
+		local t = atk.tracks[atk.i]
+		t:Stop(0)
+		t:Play(0.02)
+	end
+end
+
+local function countMatches(text, patterns)
+	local n = 0
+	for _, p in ipairs(patterns) do
+		for _ in text:gmatch(p) do n = n + 1 end
+	end
+	return n
+end
+
+-- Running Deem Admin commands for the stand user -------------------------------------------
+-- Runs a built-in command the way the admin would (name or nickname)
+local function runCommand(name, args)
+	return pcall(D.runCommand, name, table.unpack(args))
+end
+
+local function runStandCommand(name, spec, args)
+	local same = state.cmd ~= nil and state.cmd.name == name
+	local ok, err = runCommand(name, args)
+	if not ok then
+		return out("Error running " .. name .. ": " .. tostring(err))
+	end
+	if same or not spec.running() then
+		return -- a follow-up like "ufo sky", or it didn't start (usage error / "hug stop")
+	end
+	-- The command now owns your character: drop any move and the copied animations, and stop following
+	state.move = nil
+	sfCleanup()
+	if state.mirrors then
+		for _, m in pairs(state.mirrors) do pcall(function() m:Stop(0) m:Destroy() end) end
+		table.clear(state.mirrors)
+	end
+	state.cmd = { name = name, spec = spec }
+	out("Running '" .. name .. "' for " .. state.target.Name .. " - the stand waits until it's done")
+end
+
+-- "return" / "recall": cancel the running command with its own stop command
+local function endStandCommand()
+	local cmd = state.cmd
+	if not cmd then return end
+	if not cmd.spec.stop then
+		return out(cmd.name .. " can't be cancelled - the stand resumes when it finishes")
+	end
+	local parts = {}
+	for w in cmd.spec.stop:gmatch("%S+") do table.insert(parts, w) end
+	local stopName = table.remove(parts, 1)
+	local ok, err = runCommand(stopName, parts)
+	if not ok then out("Error stopping " .. cmd.name .. ": " .. tostring(err)) end
+end
+
+-- Chat out (public + whispers) -------------------------------------------------------------
+-- Sent the way the quizbot does it: TextChatService RBXGeneral:SendAsync, one message at a time with a 2.3s gap
+-- (its minMessageCooldown, to avoid the rate limit), long text split at 200 characters as "(1/2)", "(2/2)".
+local CHAT_COOLDOWN = 2.3
+local CHAT_MAX = 200
+local HELP_ON_START = true      -- whisper the stand user the list of things they can say when the stand starts
+local chatQueue, chatPumping, chatLastSent = {}, false, 0
+
+local function splitMessage(text)
+	if #text <= CHAT_MAX then return { text } end
+	local room = CHAT_MAX - 8 -- space for " (10/10)"
+	local parts, cur = {}, ""
+	for word in text:gmatch("%S+") do
+		if #cur + #word + 1 > room and cur ~= "" then
+			table.insert(parts, cur)
+			cur = word
+		else
+			cur = cur == "" and word or (cur .. " " .. word)
+		end
+	end
+	if cur ~= "" then table.insert(parts, cur) end
+	for i, p in ipairs(parts) do parts[i] = string.format("%s (%d/%d)", p, i, #parts) end
+	return parts
+end
+
+local function chatPump()
+	if chatPumping then return end
+	chatPumping = true
+	task.spawn(function()
+		while #chatQueue > 0 do
+			local job = table.remove(chatQueue, 1)
+			local gap = CHAT_COOLDOWN - (os.clock() - chatLastSent)
+			if gap > 0 then task.wait(gap) end
+			chatLastSent = os.clock()
+			local ok, err = pcall(job)
+			if not ok then out("Chat failed: " .. tostring(err)) end
+		end
+		chatPumping = false
+	end)
+end
+
+-- public chat
+local function say(text)
+	for _, part in ipairs(splitMessage(text)) do
+		table.insert(chatQueue, function()
+			local channels = TextChatService:FindFirstChild("TextChannels")
+			local general = channels and channels:FindFirstChild("RBXGeneral")
+			if general then
+				general:SendAsync(part)
+			else -- legacy chat
+				ReplicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer(part, "All")
+			end
+		end)
+	end
+	chatPump()
+end
+
+-- Whispers, the way the ChatTranslator script does them: if a whisper with that player is already open, send
+-- straight into it; otherwise type "/w <display name> <message>" into Roblox's chat bar and submit it through the
+-- bar's own handlers (Roblox's /w only recognises DISPLAY names). A "/w ..." line is never sent as public chat.
+local function findWhisperChannel(plr)
+	local channels = TextChatService:FindFirstChild("TextChannels")
+	if not channels then return nil end
+	for _, ch in ipairs(channels:GetChildren()) do
+		if ch.Name:find("^RBXWhisper:") and ch.Name:find(tostring(plr.UserId), 1, true) and ch.Name:find(tostring(lplr.UserId), 1, true) then
+			return ch
+		end
+	end
+end
+
+local function findChatBox()
+	local ok, box = pcall(function()
+		local ec = CoreGui:FindFirstChild("ExperienceChat")
+		local bar = ec and ec:FindFirstChild("chatInputBar", true)
+		return bar and bar:FindFirstChildWhichIsA("TextBox", true)
+	end)
+	return ok and box or nil
+end
+
+local function whisperNow(plr, text)
+	local ch = findWhisperChannel(plr)
+	if ch and pcall(function() ch:SendAsync(text) end) then return true end
+	local box = findChatBox()
+	if box and getconnections then
+		box.Text = "/w " .. plr.DisplayName .. " " .. text
+		local fired = false
+		for _, c in ipairs(getconnections(box.FocusLost)) do
+			if pcall(function() c:Fire(true) end) then fired = true end
+		end
+		if fired then return true end
+		box.Text = ""
+	end
+	return false
+end
+
+local function whisper(plr, text)
+	for _, part in ipairs(splitMessage(text)) do
+		table.insert(chatQueue, function()
+			if not whisperNow(plr, part) then
+				out("Couldn't whisper " .. plr.Name .. " (send them one /w by hand first): " .. part)
+			end
+		end)
+	end
+	chatPump()
+end
+
+-- What the stand user can say, built from the real tables so it never goes out of date
+local function helpLines()
+	local names = {}
+	for name in pairs(Stand_commands) do table.insert(names, name) end
+	table.sort(names)
+	return {
+		"STAND punching (kill aura on the first player in front of you): say ora / muda = barrage (longer chant = longer), punch = one hit. Your own punch also makes me hit once.",
+		"ZA WARUDO <player> = I circle them at top speed and punch until they're dead. STAR FINGER <player> = shoot / arrest / punch them depending on team + Hostile/Trespassing.",
+		"return / recall / stand back = cancel the current move.",
+		"STAND commands (say the word then a name, 'me' = you): " .. table.concat(names, ", ") .. ". Say 'return' to cancel one. Say 'stand help' to hear this again.",
+	}
+end
+
+local function whisperHelp(plr)
+	for _, line in ipairs(helpLines()) do whisper(plr, line) end
+end
+
+-- A line the stand user said: find the first move it triggers
+local function handleChat(text)
+	text = tostring(text):lower()
+
+	-- "stand help" / "stand commands": whisper them what they can say
+	if text:find("stand%s*help") or text:find("stand%s*commands") or text:find("stand%s*cmds") then
+		whisperHelp(state.target)
+		return
+	end
+
+	-- A Deem Admin command from Stand_commands: "<command> <args>" (the command is the first word)
+	local words = {}
+	for w in text:gmatch("%S+") do table.insert(words, w) end
+	local cmdName = words[1]
+	-- Nicknames: if the first word isn't a command itself, look it up in the aliases you set with "alias <nick> <command>"
+	-- (read live from admin.lua through _G.DeemAliases) and in Stand_aliases above, e.g. "bomb bob" for "tpbomb bob"
+	local liveAliases = type(_G.DeemAliases) == "table" and _G.DeemAliases or nil
+	local hops = 0
+	while cmdName and not Stand_commands[cmdName] and hops < 5 do
+		local nxt = (liveAliases and liveAliases[cmdName]) or Stand_aliases[cmdName]
+		if type(nxt) ~= "string" then break end
+		cmdName = nxt:lower()
+		hops = hops + 1
+	end
+	local cmdSpec = cmdName and Stand_commands[cmdName]
+	if cmdSpec then
+		table.remove(words, 1)
+		for i, w in ipairs(words) do
+			if w == "me" then words[i] = state.target.Name end
+		end
+		runStandCommand(cmdName, cmdSpec, words)
+		return
+	end
+
+	-- While a command is running, only "return" / "recall" do anything
+	if state.cmd then
+		for _, m in ipairs(MOVES) do
+			if m.kind == "cancel" and countMatches(text, m.patterns) > 0 then
+				endStandCommand()
+				return
+			end
+		end
+		return
+	end
+
+	-- Za Warudo: "za warudo <player>"
+	local _, zwEnd = text:find(ZW_PATTERN)
+	if zwEnd then
+		local name = text:sub(zwEnd + 1):match("(%S+)")
+		name = name and name:gsub("[%.,!%?:;]+$", "")
+		local victim = name and name ~= "" and findPlayerByName(name, state.target)
+		if victim then
+			state.move = { kind = "zawarudo", zw = true, victim = victim, untilT = os.clock() + ZW_MAX, nextPunch = 0, angle = 0 }
+			out("ZA WARUDO! Circling " .. victim.Name .. " until they're dead")
+		else
+			out("Za Warudo: say 'za warudo <player>' with a player in the server")
+		end
+		return
+	end
+
+	-- Star Finger: "star finger <player>"
+	local _, sfEnd = text:find(SF_PATTERN)
+	if sfEnd then
+		local name = text:sub(sfEnd + 1):match("(%S+)")
+		name = name and name:gsub("[%.,!%?:;]+$", "")
+		local victim = name and name ~= "" and findPlayerByName(name, state.target)
+		if victim then
+			state.move = { kind = "starfinger", sf = true, victim = victim, untilT = os.clock() + SF_MAX, nextPunch = 0, nextShot = 0 }
+			out("STAR FINGER! Targeting " .. victim.Name)
+		else
+			out("Star Finger: say 'star finger <player>' with a player in the server")
+		end
+		return
+	end
+
+	for _, move in ipairs(MOVES) do
+		local n = countMatches(text, move.patterns)
+		if n > 0 then
+			-- while Za Warudo / Star Finger is running only "return" / "recall" can interrupt it
+			if state.move and (state.move.zw or state.move.sf) and move.kind ~= "cancel" then return end
+			if move.kind == "barrage" then
+				local dur = math.clamp(n * BARRAGE_PER_WORD, BARRAGE_MIN, BARRAGE_MAX)
+				if state.move and state.move.kind == "barrage" then
+					-- chanting more extends the barrage instead of restarting it
+					state.move.untilT = math.max(state.move.untilT, os.clock() + dur)
+				else
+					state.move = { kind = "barrage", untilT = os.clock() + dur, nextPunch = 0 }
+				end
+			elseif move.kind == "punch" then
+				state.move = { kind = "punch", untilT = os.clock() + 0.5, nextPunch = 0, single = true }
+			elseif move.kind == "cancel" then
+				state.move = nil
+			end
+			return
+		end
+	end
+end
+
+-- Where the stand stands during a move: on the ground, in front of the stand user, facing their way
+local function movePosition(char, hum, tRoot, tChar)
+	local flat = CFrame.new(tRoot.Position) * CFrame.Angles(0, math.atan2(-tRoot.CFrame.LookVector.X, -tRoot.CFrame.LookVector.Z), 0)
+	local front = (flat * CFrame.new(0, 0, -FRONT_DISTANCE)).Position
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char, tChar }
+	local hit = workspace:Raycast(front + Vector3.new(0, 6, 0), Vector3.new(0, -60, 0), params)
+	local groundY = hit and hit.Position.Y or (tRoot.Position.Y - 3)
+	local root = char:FindFirstChild("HumanoidRootPart")
+	-- Height of the root part above the ground when standing. R6 has no HipHeight (legs are 2 studs long and
+	-- the root is 2 tall, so the root sits 3 up); R15 is HipHeight plus half the root's height.
+	local height
+	if hum.RigType == Enum.HumanoidRigType.R6 then
+		height = 3
+	else
+		height = hum.HipHeight + (root and root.Size.Y / 2 or 1)
+	end
+	height = height + 0.2 -- a little clearance so feet never clip the floor
+	return CFrame.new(front.X, groundY + height, front.Z) * (flat - flat.Position)
+end
+
+local function startStand(target)
+	stopStand()
+	state.target = target
+	local mirrors = {} -- [target's AnimationTrack] = our copy
+	state.mirrors = mirrors
+	local lastHum
+	local spawnT = 0 -- when the current character spawned
+	local punchSeen = {} -- [their AnimationTrack] = true while a punch animation of theirs is playing
+
+	if HELP_ON_START then
+		task.delay(1, function()
+			if state.target == target then whisperHelp(target) end
+		end)
+	end
+
+	-- Listen to what the stand user says (same source the quizbot uses)
+	state.chatConns = {}
+	local okTCS = pcall(function()
+		return TextChatService.ChatVersion == Enum.ChatVersion.TextChatService
+	end) and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService
+	if okTCS then
+		table.insert(state.chatConns, TextChatService.MessageReceived:Connect(function(msg)
+			local src = msg.TextSource
+			if src and src.UserId == target.UserId then
+				handleChat(msg.Text)
+			end
+		end))
+	else
+		table.insert(state.chatConns, target.Chatted:Connect(handleChat))
+	end
+
+	state.conn = RunService.Heartbeat:Connect(function(dt)
+		local tChar = target.Character
+		local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
+		local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
+		local char = lplr.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not (tRoot and tHum and root and hum) then
+			return
+		end
+
+		-- autoc4 is teleporting you to the C4 giver and back: hands off until it's done
+		if type(_G.DeemBusy) == "table" and _G.DeemBusy.autoc4 then
+			return
+		end
+
+		-- A Deem command the stand user ran has your character: hands off until it finishes
+		local cmd = state.cmd
+		if cmd then
+			if cmd.spec.running() then
+				return
+			end
+			out(cmd.name .. " finished - following again")
+			state.cmd = nil
+			state.move = nil
+			state.inMove, state.exitUntil = true, nil -- glide back to their side
+		end
+
+		-- New character (respawn): old copies belonged to the old one
+		if hum ~= lastHum then
+			lastHum = hum
+			spawnT = os.clock()
+			for _, m in pairs(mirrors) do pcall(function() m:Destroy() end) end
+			table.clear(mirrors)
+		end
+
+		-- Criminal + forcefield and they're inside the prison: wait here until it's safe
+		-- Same timing problem as returnbydeath: right after a respawn the team and forcefield show up a moment late,
+		-- so "no forcefield" can't be trusted yet. Keep waiting through a short grace period, and only call it
+		-- clear once the forcefield has stayed gone for FF_STABLE seconds (stops the waiting/following flicker).
+		local blocked = shouldWait(char, tRoot)
+		if not blocked and inPrison(tRoot.Position) and os.clock() - spawnT < FF_APPEAR_GRACE then
+			local team = lplr.Team
+			if team == nil or (team.Name == "Criminals" and not char:FindFirstChildOfClass("ForceField")) then
+				blocked = true
+			end
+		end
+		if blocked then
+			state.clearSince = nil
+		elseif state.waiting then
+			state.clearSince = state.clearSince or os.clock()
+			if os.clock() - state.clearSince < FF_STABLE then blocked = true end
+		end
+		if blocked then
+			if not state.waiting then
+				state.waiting = true
+				out("Waiting - you're a Criminal with a forcefield and " .. target.Name .. " is in the prison")
+			end
+			return
+		elseif state.waiting then
+			state.waiting = false
+			out("Forcefield gone / target left the prison - following")
+		end
+
+		-- A move in progress: drop to the ground in front of them and punch, then fall back to following
+		-- Their punch animation started: punch along with them (once per play of the animation)
+		local seenNow = {}
+		for _, track in ipairs(tHum:GetPlayingAnimationTracks()) do
+			local id = track.Animation and track.Animation.AnimationId or ""
+			for _, punchId in ipairs(PUNCH_ANIMS) do
+				if string.find(id, punchId, 1, true) then
+					seenNow[track] = true
+					if not punchSeen[track] then
+						punchSeen[track] = true
+						if not state.move then
+							-- fast = no gliding: snap in front of them and punch on the very same frame
+							state.move = { kind = "punch", untilT = os.clock() + 0.4, nextPunch = 0, single = true, fast = true }
+						elseif state.move.single then
+							state.move.untilT = os.clock() + 0.4
+							state.move.nextPunch = 0 -- another punch from them: another punch from us
+						end
+					end
+				end
+			end
+		end
+		for track in pairs(punchSeen) do
+			if not seenNow[track] then punchSeen[track] = nil end
+		end
+
+		local move = state.move
+		if move and os.clock() > move.untilT then
+			state.move = nil
+			move = nil
+		end
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+
+		-- Star Finger ended (target down, "return", timeout): take the silentgun grip off the Remington
+		if state.sf and not (move and move.sf and move.mode == "gun") then
+			sfCleanup()
+		end
+
+		if move then
+			state.inMove, state.exitUntil = true, nil
+			if not move.started then
+				move.started = true
+				move.glideEnd = os.clock() + GLIDE_MAX
+				-- stop the copied animations so our own punch animation can play
+				for _, m in pairs(mirrors) do pcall(function() m:Stop(0) m:Destroy() end) end
+				table.clear(mirrors)
+			end
+			-- ZA WARUDO: orbit the named victim at top speed, hitting every step, until they're dead
+			if move.zw then
+				local v = move.victim
+				if not validVictim(v, target) then
+					out("Za Warudo over - " .. (v and v.Name or "target") .. " is down")
+					state.move = nil
+					return
+				end
+				local vRoot = v.Character.HumanoidRootPart
+				move.angle = (move.angle or 0) + ZW_SPEED * dt
+				local pos = vRoot.Position + Vector3.new(math.cos(move.angle), 0, math.sin(move.angle)) * ZW_RADIUS
+				root.CFrame = CFrame.lookAt(pos, Vector3.new(vRoot.Position.X, pos.Y, vRoot.Position.Z))
+				if os.clock() >= move.nextPunch then
+					move.nextPunch = os.clock() + ZW_HIT_INTERVAL
+					hit(v, hum)
+				end
+				return
+			end
+			-- STAR FINGER: same team = kill aura, different team = shoot them with the Remington
+			if move.sf then
+				local v = move.victim
+				if not validVictim(v, target) then
+					out("Star Finger over - " .. (v and v.Name or "target") .. " is down")
+					state.move = nil
+					return
+				end
+				local vChar = v.Character
+				local vRoot = vChar.HumanoidRootPart
+				-- pick the method from the teams + Hostile / Trespassing, and re-check as those change
+				if os.clock() >= (move.nextDecide or 0) then
+					move.nextDecide = os.clock() + SF_RECHECK
+					local want, why = sfDecide(v)
+					if want == "gun" and move.noGun then want = "melee" end -- we already failed to get a gun
+					if want ~= move.mode then
+						move.mode = want
+						-- show exactly what was read, so a wrong attribute name / location is easy to spot
+						why = why .. " [team " .. teamName(v) .. ", Hostile=" .. tostring(flag(v, "Hostile")) .. ", Trespassing=" .. tostring(flag(v, "Trespassing")) .. ", you are " .. teamName(lplr) .. "]"
+						if want == "gun" then
+							out(v.Name .. " is " .. why .. " - shooting them")
+						elseif want == "melee" then
+							out(v.Name .. " is " .. why .. " - using the kill aura")
+						elseif want == "arrest" then
+							out(v.Name .. " is " .. why .. " - arresting them")
+						end
+					end
+				end
+				-- Guard and the target is neither killable nor arrestable: say so and stop
+				if move.mode == "deny" then
+					out("Star Finger: " .. v.Name .. " is not a Criminal, Hostile or Trespassing")
+					say(SF_DENY_MESSAGE)
+					state.move = nil
+					return
+				end
+				-- Guard and the target is Trespassing: arrest them (same call arrestall uses)
+				if move.mode == "arrest" then
+					local vc = vChar
+					if vc:GetAttribute("Arrested") then
+						out("Arrested " .. v.Name)
+						pcall(function() hum:UnequipTools() end)
+						state.move = nil
+						return
+					end
+					local cuffs = char:FindFirstChild("Handcuffs")
+					if not cuffs then
+						local bp = lplr:FindFirstChildWhichIsA("Backpack")
+						local inBag = bp and bp:FindFirstChild("Handcuffs")
+						if inBag then
+							pcall(function() hum:EquipTool(inBag) end)
+						else
+							out("No Handcuffs found - are you a Guard?")
+							state.move = nil
+						end
+						return
+					end
+					root.CFrame = vRoot.CFrame + ARREST_OFFSET -- the remote only works within about 8 studs
+					-- a forcefield protects them: hold here until it drops
+					if vc:FindFirstChildOfClass("ForceField") then return end
+					if not move.arresting and os.clock() >= (move.nextArrest or 0) then
+						move.arrestTries = (move.arrestTries or 0) + 1
+						if move.arrestTries > ARREST_MAX_TRIES then
+							out("Couldn't arrest " .. v.Name .. " (server answered: " .. tostring(move.lastRes) .. ")")
+							pcall(function() hum:UnequipTools() end)
+							state.move = nil
+							return
+						end
+						move.arresting = true
+						move.nextArrest = os.clock() + ARREST_INTERVAL
+						task.spawn(function()
+							local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+							local remote = remotes and remotes:FindFirstChild("ArrestPlayer")
+							if not remote then
+								out("Couldn't find the ArrestPlayer remote")
+								if state.move == move then state.move = nil end
+								return
+							end
+							local ok, res = pcall(function() return remote:InvokeServer(v, 1) end)
+							move.lastRes = ok and tostring(res) or ("error: " .. tostring(res))
+							move.arresting = false
+							if ok and res then
+								out("Arrested " .. v.Name)
+								pcall(function() hum:UnequipTools() end)
+								if state.move == move then state.move = nil end
+							end
+						end)
+					end
+					return
+				end
+				local tool
+				if move.mode == "gun" then
+					tool = getRemington()
+					if not tool then
+						if move.fetching then
+							root.CFrame = CFrame.new(SF_GUN_SPOT)
+							return
+						elseif not move.fetched then
+							out("No " .. SF_GUN_NAME .. " - teleporting to get one")
+							fetchRemington(move)
+							root.CFrame = CFrame.new(SF_GUN_SPOT)
+							return
+						end
+						out("Couldn't get a " .. SF_GUN_NAME .. " - using the kill aura instead")
+						move.mode = "melee"
+						move.noGun = true
+					end
+				end
+				if move.mode == "gun" then
+					-- equip it and give it the silentgun grip
+					if tool.Parent ~= char then pcall(function() hum:EquipTool(tool) end) end
+					if tool.Parent == char then
+						local sf = state.sf
+						if not sf or sf.tool ~= tool then
+							sf = { tool = tool, origGrip = tool.GripPos }
+							state.sf = sf
+						end
+						if tool.GripPos ~= SILENT_GRIP then tool.GripPos = SILENT_GRIP end
+					end
+					-- stand where there is a clear line to them; if a wall is in the way, move behind the target
+					local spots = sfSpots(vRoot, tRoot)
+					if os.clock() >= (move.nextSpotCheck or 0) then
+						move.nextSpotCheck = os.clock() + 0.1
+						local up = Vector3.new(0, 1.5, 0)
+						local cur = move.slot and spots[move.slot]
+						if not (cur and clearShot(cur.Position + up, vChar, char)) then
+							local pick
+							for i, s in ipairs(spots) do
+								if clearShot(s.Position + up, vChar, char) then pick = i break end
+							end
+							pick = pick or 2 -- nowhere is clear: behind the target
+							if pick ~= move.slot then
+								if move.slot then out("Wall in the way - " .. SF_SPOT_NAMES[pick]) end
+								move.slot = pick
+							end
+						end
+					end
+					root.CFrame = spots[move.slot or 1]
+					-- shoot
+					if tool.Parent == char and os.clock() >= move.nextShot then
+						move.nextShot = os.clock() + SF_SHOT_INTERVAL
+						local head = vChar:FindFirstChild("Head") or vRoot
+						pcall(function()
+							ReplicatedStorage.GunRemotes.ShootEvent:FireServer({
+								{ root.Position, head.Position, head },
+							})
+						end)
+					end
+					return
+				end
+				-- kill aura on a team mate (or when no gun could be had)
+				root.CFrame = victimPosition(vRoot, tRoot)
+				if os.clock() >= move.nextPunch then
+					move.nextPunch = os.clock() + PUNCH_INTERVAL
+					hit(v, hum)
+				end
+				return
+			end
+			-- glide down in front of them (tracks them live, so it stays smooth if they move)
+			-- pick (or re-pick) the victim: the first player in front of the stand user
+			move.startT = move.startT or os.clock()
+			-- single punches scan every frame until they find someone; barrages rescan on an interval
+			if not validVictim(move.victim, target) and (move.single or os.clock() >= (move.nextScan or 0)) then
+				move.nextScan = os.clock() + RESCAN_INTERVAL
+				move.victim = findVictim(char, tChar, tRoot, target)
+				if move.victim then out("Attacking " .. move.victim.Name) end
+			end
+			local victim = validVictim(move.victim, target) and move.victim or nil
+			local vRoot = victim and victim.Character.HumanoidRootPart
+			local function goal()
+				if vRoot then return victimPosition(vRoot, tRoot) end
+				return movePosition(char, hum, tRoot, tChar)
+			end
+			if move.fast and not move.arrived then
+				move.arrived = true
+				root.CFrame = goal()
+			end
+			if not move.arrived then
+				if glideTo(root, goal(), dt) or os.clock() > move.glideEnd then
+					move.arrived = true
+				else
+					return
+				end
+			end
+			root.CFrame = goal()
+			-- a single punch waits briefly for a victim instead of wasting its one shot on the air
+			local waiting = move.single and not victim and (os.clock() - move.startT) < 0.2
+			if os.clock() >= move.nextPunch and not waiting then
+				move.nextPunch = os.clock() + PUNCH_INTERVAL
+				if victim then
+					hit(victim, hum)
+				else
+					out("Nobody in front of " .. target.Name .. " - punching the air")
+					pressPunch() -- nobody in front of them: punch the air like before
+				end
+				if move.single then move.nextPunch = math.huge end -- one punch, then hold the pose until untilT
+			end
+			return
+		end
+		if state.inMove then
+			-- the move just ended: glide back up to their side, then carry on following normally
+			state.exitUntil = state.exitUntil or (os.clock() + GLIDE_MAX)
+			if glideTo(root, tRoot.CFrame * OFFSET, dt) or os.clock() > state.exitUntil then
+				state.inMove, state.exitUntil = false, nil
+			else
+				return
+			end
+		end
+		root.CFrame = tRoot.CFrame * OFFSET
+
+		-- Copy animations: start copies of new tracks, keep speed / weight / time in sync, drop finished ones
+		local playing = {}
+		for _, track in ipairs(tHum:GetPlayingAnimationTracks()) do
+			local animId = track.Animation and track.Animation.AnimationId or ""
+			if not string.find(animId, SKIP_ANIM) then
+				playing[track] = true
+				local copy = mirrors[track]
+				if not copy then
+					local ok, loaded = pcall(function() return hum:LoadAnimation(track.Animation) end)
+					if ok and loaded then
+						copy = loaded
+						mirrors[track] = copy
+						copy.Priority = track.Priority
+						copy.Looped = track.Looped
+						copy:Play(0.05, math.max(track.WeightCurrent, 0.01), track.Speed)
+						copy.TimePosition = track.TimePosition
+					end
+				end
+				if copy then
+					if not copy.IsPlaying then
+						copy:Play(0.05, math.max(track.WeightCurrent, 0.01), track.Speed)
+					end
+					copy:AdjustSpeed(track.Speed)
+					copy:AdjustWeight(math.max(track.WeightCurrent, 0.01), 0)
+					if math.abs(copy.TimePosition - track.TimePosition) > 0.1 then
+						copy.TimePosition = track.TimePosition
+					end
+				end
+			end
+		end
+		for track, copy in pairs(mirrors) do
+			if not playing[track] then
+				pcall(function() copy:Stop(0.05) copy:Destroy() end)
+				mirrors[track] = nil
+			end
+		end
+
+		-- Stop our own animations (the default walk / idle) so only the copied ones show
+		local ours = {}
+		for _, copy in pairs(mirrors) do ours[copy] = true end
+		for _, t in ipairs(hum:GetPlayingAnimationTracks()) do
+			if not ours[t] then
+				t:Stop(0)
+			end
+		end
+	end)
+end
+
+Commands.stand = function(arg)
+	local name = arg and tostring(arg)
+	if name and name:lower() == "stop" then
+		if state.conn then
+			stopStand()
+			return out("Stand stopped")
+		end
+		return out("No stand is active")
+	end
+	if not name then
+		if state.conn then
+			stopStand()
+			return out("Stand stopped")
+		end
+		return out("Usage: stand <player>")
+	end
+
+	local target = findPlayer(name)
+	if not target then
+		return out("No player found for '" .. name .. "'")
+	end
+	startStand(target)
+	out("Now " .. target.Name .. "'s stand (run 'stand stop' to stop)")
+end
+end
+--// Loader + runners \\-------------------------------------------------------------
+
+-- Everything registered so far is built in; files in Deem_commands only add commands that aren't built in
+-- (so an old copy of tpbomb.lua etc. in the folder can never replace the merged versions).
+for name in pairs(Commands) do D.builtin[name] = true end
+
+function D.loadExternal()
+	if not (isfolder and makefolder and listfiles and readfile) then return end
+	if not isfolder(CommandsDirectory) then pcall(makefolder, CommandsDirectory) end
+	local okList, files = pcall(listfiles, CommandsDirectory)
+	if not okList then return end
+	for _, filePath in ipairs(files) do
+		local fileName = filePath:match("[^\\/]+%.lua$") or filePath:match("[^\\/]+%.txt$")
+		if fileName then
+			local commandName = fileName:sub(1, #fileName - 4):lower()
+			if D.builtin[commandName] then
+				-- built in already: skip silently
+			else
+				local call, err = loadstring(readfile(filePath))
+				if not call then
+					warn("Failed to load command:", filePath, "Error:", err)
+				else
+					local success, fn = pcall(call)
+					if success and type(fn) == "function" then
+						Commands[commandName] = fn
+					else
+						warn("Command script must return a function:", filePath)
+					end
+				end
+			end
+		end
+	end
+end
+
+local loadOk, loadErr = pcall(D.loadExternal)
+if not loadOk then
+	warn("Deem Admin: could not load custom commands:", loadErr)
+end
+
+local function split(str, sep)
+	local out = {}
+	for token in string.gmatch(str, "[^" .. sep .. "]+") do
+		table.insert(out, token)
+	end
+	return out
+end
+
+local function runLine(line, feedback)
+	local args = split(line, " ")
+	if #args == 0 then return end
+	local commandName = resolveCommand(table.remove(args, 1))
+	local fn = Commands[commandName]
+	if not fn then
+		return feedback("Unknown command: " .. commandName)
+	end
+	local success, err = pcall(fn, table.unpack(args))
+	if success then
+		feedback("Executed '" .. commandName .. "' successfully!")
+	else
+		feedback("Error executing '" .. commandName .. "': " .. tostring(err))
+	end
+end
+
+-- Chat command runner  (;command args)
+local function processChatMessage(message)
+	if message:sub(1, #ChatPrefix) == ChatPrefix then
+		runLine(message:sub(#ChatPrefix + 1), sendChatFeedback)
+	end
+end
+
+-- Command bar runner
+local function processInputCommand(cmd)
+	runLine(cmd, sendOutputFeedback)
+end
+
+-- Press ; to focus the command bar
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Enum.KeyCode.Semicolon then
+		Input:CaptureFocus()
+		task.defer(function() Input.Text = "" end)
+	end
+end)
+
+Input.FocusLost:Connect(function(enterPressed)
+	if enterPressed then
+		processInputCommand(Input.Text)
+		Input.Text = ""
+	end
+end)
+
+plr.Chatted:Connect(processChatMessage)
