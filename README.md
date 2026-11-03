@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/somerandoalt/Deem-Adm
 
 ---
 
-Deem Admin is a modular admin system compatible with the legacy chat system or UI. It includes only essential universal commands by default.
+Deem Admin is a modular admin system compatible with the the current chat system or UI. It includes only essential universal commands by default.
 
 ---
 
