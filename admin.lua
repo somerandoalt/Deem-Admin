@@ -713,10 +713,7 @@ local Aliases = {
 	remotes = "getremotes",
 	events = "getremoteevents",
 	funcs = "getremotefunctions",
-	nc = "noclip",
-	c = "clip",
 	fcd = "fireclickdetectors",
-	discord = "supportserver",
 	npc = "noproximitycooldown",
 	spoof = "spoofmemory",
 	tp = "tpgui",
@@ -822,33 +819,12 @@ Commands = {
 		end
 	end,
 
-	noclip = function(...)
-		for i, v in pairs(plr.Character:GetChildren()) do
-			if v:IsA("BasePart") then
-				v.CanCollide = false
-			end
-		end
-	end,
-
-	clip = function(...)
-		for i, v in pairs(plr.Character:GetChildren()) do
-			if v:IsA("BasePart") then
-				v.CanCollide = true
-			end
-		end
-	end,
-
 	fireclickdetectors = function(...)
 		for i, v in pairs(workspace:GetDescendants()) do
 			if v:IsA("ClickDetector") then
 				fireclickdetector(v)
 			end
 		end
-	end,
-
-	supportserver = function(...)
-		sendOutputFeedback("discord.gg/su7ycRRJyz\n Server link has been copied to your clipboard.\n")
-		setclipboard("discord.gg/su7ycRRJyz")
 	end,
 
 	noproximitycooldown = function(...)
